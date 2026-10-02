@@ -1,42 +1,73 @@
 {
   "expo": {
-    "name": "suraksha-mobile",
+    "name": "Suraksha",
     "slug": "suraksha-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
-    "scheme": "surakshamobile",
-    "userInterfaceStyle": "automatic",
+    "scheme": "suraksha",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
     "ios": {
-      "icon": "./assets/expo.icon"
+      "supportsTablet": false,
+      "bundleIdentifier": "com.suraksha.emergency",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Suraksha uses Bluetooth to relay emergency SOS messages to nearby phones when you have no internet connection.",
+        "NSBluetoothPeripheralUsageDescription": "Suraksha uses Bluetooth to broadcast emergency SOS alerts to nearby devices.",
+        "NSLocationWhenInUseUsageDescription": "Suraksha needs your location to send accurate emergency coordinates with your SOS alert.",
+        "NSLocationAlwaysUsageDescription": "Suraksha needs background location access to relay emergency SOS messages from nearby phones.",
+        "UIBackgroundModes": [
+          "bluetooth-central",
+          "bluetooth-peripheral",
+          "location"
+        ]
+      }
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
+      "package": "com.suraksha.emergency",
+      "permissions": [
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_ADVERTISE",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
     },
     "web": {
-      "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "bundler": "metro",
+      "output": "static"
     },
     "plugins": [
       "expo-router",
+      "expo-location",
       [
-        "expo-splash-screen",
+        "expo-build-properties",
         {
-          "backgroundColor": "#208AEF",
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 76
+          "android": {
+            "compileSdkVersion": 36,
+            "targetSdkVersion": 35,
+            "minSdkVersion": 26,
+            "kotlinVersion": "2.1.20"
+          },
+          "ios": {
+            "deploymentTarget": "16.4"
+          }
         }
       ]
     ],
     "experiments": {
-      "typedRoutes": true,
-      "reactCompiler": true
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "74126eea-90fe-412f-99ab-54e79cbaac7c"
+      }
     }
   }
 }
