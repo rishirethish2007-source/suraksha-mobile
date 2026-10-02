@@ -48,7 +48,8 @@ export function useSOS() {
   ) => {
     setError(null);
     try {
-      await SOSTriggerService.cancelSOS(sosId, userId, reason, authToken);
+      const delivered = await SOSTriggerService.cancelSOS(sosId, userId, reason, authToken);
+      if (!delivered) setError("Cancellation saved locally; server confirmation is pending.");
       setLastSOS(null);
     } catch (err: any) {
       setError(err.message || 'Failed to cancel SOS');

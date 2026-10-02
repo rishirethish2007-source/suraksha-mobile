@@ -21,7 +21,7 @@ export function useBLEMesh(selfDeviceId: string) {
       try {
         const loc = await LocationService.getCurrentLocation();
         setSelfLocation(loc);
-      } catch (e) {
+      } catch {
         // Silent fail on background location update
       }
     };
@@ -51,12 +51,13 @@ export function useBLEMesh(selfDeviceId: string) {
       });
 
       // Relay Logic
-      const { isOnline } = await NetworkService.checkConnectivity();
+      const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
       if (isOnline) {
         try {
           // If online, upload to server directly
-          await SOSApiService.sendSOS(payload);
-        } catch (e) {
+          if (payload.hopCount >= payload.maxHops) return;
+          await SOSApiService.sendSOS(bleMeshInstance.prepareRelay(payload, selfDeviceId, selfLocation));
+        } catch {
           // If server upload fails, fallback to relay
           bleMeshInstance.relayPayload(payload, selfDeviceId, selfLocation);
         }
@@ -70,16 +71,21 @@ export function useBLEMesh(selfDeviceId: string) {
       setError(err.message || 'BLE Mesh Error');
     };
 
-    bleMeshInstance.on('onSOSReceived', handleSOSReceived);
+    const receive = (payload: SOSPayload) => { void handleSOSReceived(payload).catch(handleError); };
+    bleMeshInstance.on('onSOSReceived', receive);
     bleMeshInstance.on('onError', handleError);
 
-    bleMeshInstance.startScanning();
-    setIsScanning(true);
+    let disposed = false;
+    void bleMeshInstance.startScanning().then(() => {
+      if (!disposed) setIsScanning(true);
+      else void bleMeshInstance.stopScanning().catch(() => undefined);
+    }).catch(handleError);
 
     return () => {
-      bleMeshInstance.off('onSOSReceived', handleSOSReceived);
+      bleMeshInstance.off('onSOSReceived', receive);
       bleMeshInstance.off('onError', handleError);
-      bleMeshInstance.stopScanning();
+      disposed = true;
+      void bleMeshInstance.stopScanning().catch(() => undefined);
       setIsScanning(false);
     };
   }, [selfDeviceId, selfLocation]);

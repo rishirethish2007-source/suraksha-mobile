@@ -8,36 +8,59 @@ import {
   TouchableOpacity,
   Modal,
   Vibration,
-  Alert,
+  TextInput,
+  ScrollView,
 } from 'react-native';
 
 // ── Config ──────────────────────────────────────────────────────
-const API_BASE = 'http://10.61.126.110:8000/api/v1';
+import { SOSTriggerService } from '../services/sos-trigger.service';
+import { SOSApiService } from '../services/sos-api.service';
+import { useBLEMesh } from '../hooks/useBLEMesh';
+import { NetworkService } from '../services/network.service';
+import { DeliveryMethod, SOSType, SOSPayload } from '../interfaces/sos.types';
 
-const SOS_TYPES = ['MEDICAL', 'FIRE', 'FLOOD', 'EARTHQUAKE', 'VIOLENCE', 'OTHER'] as const;
-type SOSType = (typeof SOS_TYPES)[number];
+const SOS_TYPES = Object.values(SOSType);
 
 const LONG_PRESS_MS = 3000;
 
-// ── Simple UUID generator ───────────────────────────────────────
-function uuid(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+function RelayPanel({ deviceId }: { deviceId: string }) {
+  const { isScanning, nearbySOSEvents, error } = useBLEMesh(deviceId);
+  return <View style={{ padding: 16 }}>
+    <Text style={{ color: '#ddd' }}>{isScanning ? 'Scanning for nearby SOS alerts' : 'Starting Bluetooth…'}</Text>
+    {error && <Text style={{ color: '#ff9b90' }}>{error}</Text>}
+    {nearbySOSEvents.map(event => <Text key={event.sosId} style={{ color: '#fff', marginTop: 8 }}>
+      Nearby {event.sosType}: {event.userName}. Received over Bluetooth; origin is unverified.
+    </Text>)}
+  </View>;
 }
 
 // ── Main Screen ─────────────────────────────────────────────────
 export default function Index() {
   const [isPressing, setIsPressing] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
-  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'queued' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
+  const [userId, setUserId] = useState('');
+  const [userName, setUserName] = useState('');
+  const [userPhone, setUserPhone] = useState('');
+  const [token, setToken] = useState('');
+  const [lastSOS, setLastSOS] = useState<SOSPayload | null>(null);
+  const sending = useRef(false);
+  const [relayDevice, setRelayDevice] = useState<string | null>(null);
+  useEffect(() => {
+    SOSApiService.setAuthToken(token.trim() || undefined);
+    const retry = () => { void SOSTriggerService.retryPendingQueue().catch(() => undefined); };
+    retry();
+    const unsubscribe = NetworkService.subscribe(online => { if (online) retry(); });
+    const timer = setInterval(retry, 30000);
+    return () => { unsubscribe(); clearInterval(timer); };
+  }, [token]);
 
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const progressAnim = useRef(new Animated.Value(0)).current;
+  const [pulseAnim] = useState(() => new Animated.Value(1));
+  const [progressAnim] = useState(() => new Animated.Value(0));
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => { if (pressTimer.current) clearTimeout(pressTimer.current); }, []);
 
   // Pulse animation
   useEffect(() => {
@@ -51,11 +74,11 @@ export default function Index() {
       loop.start();
       return () => loop.stop();
     }
-  }, [status, isPressing]);
+  }, [status, isPressing, pulseAnim]);
 
   // ── Press handlers ────────────────────────────────────────────
   const onPressIn = () => {
-    if (status === 'sending') return;
+    if (sending.current || showPicker) return;
     setIsPressing(true);
     Vibration.vibrate(50);
     Animated.timing(progressAnim, { toValue: 1, duration: LONG_PRESS_MS, useNativeDriver: false }).start();
@@ -73,66 +96,46 @@ export default function Index() {
     Animated.timing(progressAnim, { toValue: 0, duration: 200, useNativeDriver: false }).start();
   };
 
-  // ── Send SOS directly to backend ─────────────────────────────
   const sendSOS = async (type: SOSType) => {
+    if (sending.current) return;
+    sending.current = true;
     setShowPicker(false);
     setStatus('sending');
-    setStatusMsg('⏳ Sending SOS to server...');
-
-    const payload = {
-      sos_id: uuid(),
-      user_id: 'test_user_999',
-      user_name: 'Test User',
-      user_phone: '+919876543210',
-      sos_type: type,
-      message_type: 'SOS_ALERT',
-      location: {
-        lat: 19.076,
-        lng: 72.8777,
-        altitude: 14.0,
-        accuracy: 5.0,
-        provider: 'gps',
-      },
-      status: 'ACTIVE',
-      delivery_method: 'DIRECT_ONLINE',
-      hop_count: 0,
-      max_hops: 15,
-      relay_chain: [],
-      message: `Emergency ${type} - SOS from Suraksha App`,
-      ttl_seconds: 3600,
-      client_timestamp: new Date().toISOString(),
-    };
-
+    setStatusMsg('Acquiring your location and sending SOS…');
     try {
-      const res = await fetch(`${API_BASE}/sos`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test_token_123' },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json();
-
-      if (res.ok) {
+      const payload = await SOSTriggerService.triggerSOS({ userId, userName, userPhone,
+        authToken: token.trim() || undefined, sosType: type });
+      setLastSOS(payload);
+      if (payload.deliveryMethod === DeliveryMethod.DIRECT_ONLINE) {
         setStatus('sent');
-        setStatusMsg(`✅ SOS received by server!\nID: ${payload.sos_id.substring(0, 8)}...\nType: ${type}`);
-        console.log('✅ Server response:', JSON.stringify(data, null, 2));
+        setStatusMsg(`SOS received by server. ID: ${payload.sosId.slice(0, 8)}`);
       } else {
-        setStatus('error');
-        setStatusMsg(`❌ Server error ${res.status}: ${data.detail || JSON.stringify(data)}`);
-        console.error('Server error:', data);
+        setStatus('queued');
+        setStatusMsg(payload.deliveryMethod === DeliveryMethod.BLE_RELAY
+          ? 'SOS saved locally and advertising over Bluetooth. Server receipt is not confirmed.'
+          : 'SOS saved on this device. Waiting for connectivity; server receipt is not confirmed.');
       }
-    } catch (err: any) {
+    } catch (error) {
       setStatus('error');
-      setStatusMsg(`❌ Network error: ${err.message}\n\nIs your backend running on port 8000?`);
-      console.error('Network error:', err);
-    }
-
-    // Reset after 6 seconds
-    setTimeout(() => {
-      setStatus('idle');
-      setStatusMsg('');
+      setStatusMsg(error instanceof Error ? error.message : 'Unable to send SOS.');
+    } finally {
+      sending.current = false;
       progressAnim.setValue(0);
-    }, 6000);
+    }
+  };
+
+  const cancelSOS = async () => {
+    if (!lastSOS || sending.current) return;
+    sending.current = true;
+    try {
+      const confirmed = await SOSTriggerService.cancelSOS(lastSOS.sosId, lastSOS.userId, undefined, token.trim() || undefined);
+      setStatus(confirmed ? 'idle' : 'queued');
+      setStatusMsg(confirmed ? 'SOS cancellation confirmed by server.' : 'Cancellation saved. Server confirmation is pending.');
+      setLastSOS(null);
+    } catch (error) {
+      setStatus('error');
+      setStatusMsg(error instanceof Error ? error.message : 'Unable to save cancellation.');
+    } finally { sending.current = false; }
   };
 
   // ── Progress bar height ───────────────────────────────────────
@@ -143,9 +146,21 @@ export default function Index() {
 
   return (
     <SafeAreaView style={styles.root}>
+      <ScrollView contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>🛡️ Suraksha</Text>
       <Text style={styles.subtitle}>Emergency Response Network</Text>
+      <View style={{ paddingHorizontal: 20, gap: 8 }}>
+        <TextInput accessibilityLabel="User ID" style={styles.input} placeholder="User ID from your account" placeholderTextColor="#888" value={userId} onChangeText={setUserId} autoCapitalize="none" />
+        <TextInput accessibilityLabel="Name" style={styles.input} placeholder="Your name" placeholderTextColor="#888" value={userName} onChangeText={setUserName} />
+        <TextInput accessibilityLabel="Phone" style={styles.input} placeholder="Phone number" placeholderTextColor="#888" value={userPhone} onChangeText={setUserPhone} keyboardType="phone-pad" />
+        <TextInput accessibilityLabel="Session token" style={styles.input} placeholder="Session token (until sign-in is integrated)" placeholderTextColor="#888" value={token} onChangeText={setToken} autoCapitalize="none" secureTextEntry />
+      </View>
 
+      <TouchableOpacity style={styles.cancelBtn} onPress={() => {
+        if (relayDevice) setRelayDevice(null);
+        else void SOSTriggerService.getDeviceId().then(setRelayDevice).catch(() => setStatusMsg('Unable to initialize this device.'));
+      }}><Text style={styles.statusText}>{relayDevice ? 'Stop nearby relay' : 'Enable nearby relay'}</Text></TouchableOpacity>
+      {relayDevice && <RelayPanel deviceId={relayDevice} />}
       {/* ── SOS Button ── */}
       <View style={styles.center}>
         <Animated.View
@@ -171,8 +186,9 @@ export default function Index() {
         </View>
       )}
 
+      {lastSOS && <TouchableOpacity style={styles.cancelBtn} onPress={cancelSOS}><Text style={styles.statusText}>Cancel this SOS</Text></TouchableOpacity>}
       {/* ── Type Picker Modal ── */}
-      <Modal visible={showPicker} transparent animationType="slide">
+      <Modal visible={showPicker} transparent animationType="slide" onRequestClose={() => setShowPicker(false)}>
         <View style={styles.modalBg}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Select Emergency Type</Text>
@@ -187,14 +203,16 @@ export default function Index() {
           </View>
         </View>
       </Modal>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 // ── Styles ──────────────────────────────────────────────────────
 const styles = StyleSheet.create({
+  input: { color: "#fff", borderWidth: 1, borderColor: "#444", borderRadius: 8, padding: 8 },
   root: { flex: 1, backgroundColor: '#0D0D0D' },
-  title: { fontSize: 30, fontWeight: 'bold', color: '#fff', textAlign: 'center', marginTop: 60 },
+  title: { fontSize: 30, fontWeight: 'bold', color: '#fff', textAlign: 'center', marginTop: 20 },
   subtitle: { fontSize: 14, color: '#777', textAlign: 'center', marginTop: 4 },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
 

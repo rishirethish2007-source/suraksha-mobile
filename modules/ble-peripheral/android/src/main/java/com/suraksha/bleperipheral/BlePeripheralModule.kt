@@ -6,6 +6,9 @@ import android.bluetooth.le.*
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.ConcurrentHashMap
 import android.os.ParcelUuid
 import android.util.Base64
 import android.util.Log
@@ -43,6 +46,17 @@ class BlePeripheralModule : Module() {
     private var cancelPayloadBase64: String? = null
     private var scanner: BluetoothLeScanner? = null
     private var isScanning = false
+    private var advertisingPromise: Promise? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private val connectedDevices = ConcurrentHashMap<String, BluetoothGatt>()
+    private val readMtu = ConcurrentHashMap<String, Int>()
+    private val advertisingTimeout = Runnable {
+        advertisingPromise?.reject("BLE_ADV_TIMEOUT", "Bluetooth advertising timed out", null)
+        advertisingPromise = null
+        stopBleAdvertising()
+        stopGattServer()
+        isAdvertising = false
+    }
 
     override fun definition() = ModuleDefinition {
         Name("BlePeripheral")
@@ -94,20 +108,27 @@ class BlePeripheralModule : Module() {
         // ──────────────────────────────────────────────────────────
         AsyncFunction("startAdvertising") { payloadBase64: String, promise: Promise ->
             try {
+                if (Base64.decode(payloadBase64, Base64.DEFAULT).size > 512) {
+                    throw Exception("GATT payload exceeds 512 bytes")
+                }
+                if (advertisingPromise != null) throw Exception("Advertising is already starting")
                 if (isAdvertising) {
+                    currentPayloadBase64 = payloadBase64
                     promise.resolve(true)
                     return@AsyncFunction
                 }
 
+                if (advertiser == null) throw Exception("Bluetooth is not initialized")
                 currentPayloadBase64 = payloadBase64
-                startGattServer()
-                startBleAdvertising()
-                isAdvertising = true
+                advertisingPromise = promise
+                handler.postDelayed(advertisingTimeout, 10000)
+                startGattServer() // Advertising begins only after onServiceAdded.
 
-                Log.i(TAG, "Advertising started. Payload size: ${payloadBase64.length} chars")
-                promise.resolve(true)
             } catch (e: Exception) {
                 Log.e(TAG, "Advertising failed: ${e.message}")
+                handler.removeCallbacks(advertisingTimeout)
+                advertisingPromise = null
+                stopGattServer()
                 promise.reject("BLE_ADV_ERROR", e.message, e)
             }
         }
@@ -117,6 +138,9 @@ class BlePeripheralModule : Module() {
         // ──────────────────────────────────────────────────────────
         AsyncFunction("stopAdvertising") { promise: Promise ->
             try {
+                handler.removeCallbacks(advertisingTimeout)
+                advertisingPromise?.reject("BLE_ADV_CANCELLED", "Advertising stopped", null)
+                advertisingPromise = null
                 stopBleAdvertising()
                 stopGattServer()
                 isAdvertising = false
@@ -193,6 +217,16 @@ class BlePeripheralModule : Module() {
         // ──────────────────────────────────────────────────────────
         //  isSupported() -> Boolean
         // ──────────────────────────────────────────────────────────
+        OnDestroy {
+            handler.removeCallbacksAndMessages(null)
+            if (isScanning) scanner?.stopScan(scanCallback)
+            stopBleAdvertising()
+            stopGattServer()
+            connectedDevices.values.forEach { it.disconnect(); it.close() }
+            connectedDevices.clear()
+            readMtu.clear()
+        }
+
         Function("isSupported") {
             val adapter = BluetoothAdapter.getDefaultAdapter()
             adapter != null && adapter.isMultipleAdvertisementSupported
@@ -204,10 +238,9 @@ class BlePeripheralModule : Module() {
     // ══════════════════════════════════════════════════════════════
 
     private fun startGattServer() {
-        val context = appContext.reactContext ?: return
-        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
-
-        gattServer = manager.openGattServer(context, gattServerCallback)
+        val context = appContext.reactContext ?: throw Exception("No context")
+        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: throw Exception("No Bluetooth manager")
+        gattServer = manager.openGattServer(context, gattServerCallback) ?: throw Exception("Cannot open GATT server")
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
@@ -227,7 +260,7 @@ class BlePeripheralModule : Module() {
         )
         service.addCharacteristic(cancelChar)
 
-        gattServer?.addService(service)
+        if (gattServer?.addService(service) != true) throw Exception("Cannot add GATT service")
         Log.i(TAG, "GATT Server started with SOS + Cancel characteristics")
     }
 
@@ -245,6 +278,21 @@ class BlePeripheralModule : Module() {
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            if (advertisingPromise == null) return
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                try { startBleAdvertising() } catch (error: Exception) {
+                    advertisingPromise?.reject("BLE_ADV_ERROR", error.message, error)
+                    advertisingPromise = null
+                }
+            } else {
+                advertisingPromise?.reject("BLE_GATT_ERROR", "Cannot publish GATT service", null)
+                advertisingPromise = null
+            }
+        }
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            readMtu[device.address] = mtu
+        }
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> Log.i(TAG, "GATT: Device connected: ${device?.address}")
@@ -266,7 +314,12 @@ class BlePeripheralModule : Module() {
             }
 
             if (data != null && device != null) {
-                val chunk = if (offset < data.size) data.copyOfRange(offset, data.size) else ByteArray(0)
+                if (offset > data.size || offset < 0) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                    return
+                }
+                val end = minOf(data.size, offset + (readMtu[device.address] ?: 23) - 1)
+                val chunk = data.copyOfRange(offset, end)
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, chunk)
             } else {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, 0, null)
@@ -300,10 +353,19 @@ class BlePeripheralModule : Module() {
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            handler.removeCallbacks(advertisingTimeout)
+            isAdvertising = true
+            advertisingPromise?.resolve(true)
+            advertisingPromise = null
             Log.i(TAG, "BLE advertising started successfully")
         }
 
         override fun onStartFailure(errorCode: Int) {
+            handler.removeCallbacks(advertisingTimeout)
+            isAdvertising = false
+            advertisingPromise?.reject("BLE_ADV_ERROR", "Advertising failed: $errorCode", null)
+            advertisingPromise = null
+            stopGattServer()
             Log.e(TAG, "BLE advertising failed with error code: $errorCode")
             sendEvent("onError", mapOf("error" to "Advertising failed: code $errorCode"))
         }
@@ -329,6 +391,7 @@ class BlePeripheralModule : Module() {
         }
 
         override fun onScanFailed(errorCode: Int) {
+            isScanning = false
             Log.e(TAG, "BLE scan failed: $errorCode")
             sendEvent("onError", mapOf("error" to "Scan failed: code $errorCode"))
         }
@@ -341,12 +404,17 @@ class BlePeripheralModule : Module() {
     private fun connectAndReadPayload(device: BluetoothDevice) {
         val context = appContext.reactContext ?: return
 
-        device.connectGatt(context, false, object : BluetoothGattCallback() {
+        if (connectedDevices.containsKey(device.address)) return
+        val connection = device.connectGatt(context, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    connectedDevices.remove(device.address)
+                    gatt.close()
+                } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                     Log.i(TAG, "Connected to ${device.address}, discovering services...")
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    connectedDevices.remove(device.address)
                     gatt.close()
                 }
             }
@@ -356,12 +424,12 @@ class BlePeripheralModule : Module() {
                     val service = gatt.getService(SERVICE_UUID)
                     val sosChar = service?.getCharacteristic(SOS_CHAR_UUID)
                     if (sosChar != null) {
-                        gatt.readCharacteristic(sosChar)
+                        if (!gatt.readCharacteristic(sosChar)) gatt.disconnect()
                     } else {
                         Log.w(TAG, "SOS characteristic not found on ${device.address}")
                         gatt.disconnect()
                     }
-                }
+                } else { gatt.disconnect() }
             }
 
             override fun onCharacteristicRead(
@@ -388,5 +456,14 @@ class BlePeripheralModule : Module() {
                 gatt.disconnect()
             }
         })
+        if (connection != null) {
+            connectedDevices[device.address] = connection
+            handler.postDelayed({
+                if (connectedDevices.remove(device.address, connection)) {
+                    connection.disconnect()
+                    connection.close()
+                }
+            }, 15000)
+        }
     }
 }

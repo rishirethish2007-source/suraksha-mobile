@@ -5,8 +5,8 @@
  * implementations to JavaScript/TypeScript via Expo Modules.
  */
 
-import { NativeModule, requireNativeModule } from 'expo-modules-core';
-import { EventEmitter, type EventSubscription } from 'expo-modules-core';
+import { NativeModule, requireNativeModule } from 'expo';
+type EventSubscription = { remove(): void };
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -27,7 +27,13 @@ export interface BleErrorEvent {
 
 // ── Native Module Interface ─────────────────────────────────────
 
-interface BlePeripheralNativeModule extends NativeModule {
+type BleEvents = {
+  onSOSReceived: (event: SOSReceivedEvent) => void;
+  onCancelReceived: (event: SOSReceivedEvent) => void;
+  onDeviceDiscovered: (event: DeviceDiscoveredEvent) => void;
+  onError: (event: BleErrorEvent) => void;
+};
+declare class BlePeripheralNativeModule extends NativeModule<BleEvents> {
   initialize(): Promise<boolean>;
   startAdvertising(payloadBase64: string): Promise<boolean>;
   stopAdvertising(): Promise<boolean>;
@@ -44,10 +50,10 @@ let nativeModule: BlePeripheralNativeModule | null = null;
 try {
   nativeModule = requireNativeModule<BlePeripheralNativeModule>('BlePeripheral');
 } catch (e) {
-  console.warn('[BlePeripheral] Native module not found. Running in mock mode.');
+  console.warn('[BlePeripheral] Native module not found. BLE is unavailable in this build.');
 }
 
-const emitter = nativeModule ? new EventEmitter(nativeModule) : null;
+const emitter = nativeModule ? nativeModule : null;
 
 // ── Public API ──────────────────────────────────────────────────
 

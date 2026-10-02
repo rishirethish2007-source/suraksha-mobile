@@ -8,7 +8,6 @@ import {
   Text,
   StyleSheet,
   Animated,
-  PanResponder,
   Vibration,
   ViewStyle,
   Modal,
@@ -29,14 +28,14 @@ export const SOSButton: React.FC<SOSButtonProps> = ({ onTrigger, disabled, style
   const [isTriggered, setIsTriggered] = useState(false);
   const [showTypeSelector, setShowTypeSelector] = useState(false);
   
-  const progressAnim = useRef(new Animated.Value(0)).current;
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const pressTimeout = useRef<NodeJS.Timeout | null>(null);
+  const [progressAnim] = useState(() => new Animated.Value(0));
+  const [pulseAnim] = useState(() => new Animated.Value(1));
+  const pressTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Pulse animation for idle state
   useEffect(() => {
     if (!isPressing && !isTriggered && !disabled) {
-      Animated.loop(
+      const loop = Animated.loop(
         Animated.sequence([
           Animated.timing(pulseAnim, {
             toValue: 1.1,
@@ -49,11 +48,13 @@ export const SOSButton: React.FC<SOSButtonProps> = ({ onTrigger, disabled, style
             useNativeDriver: true,
           }),
         ])
-      ).start();
+      );
+      loop.start();
+      return () => loop.stop();
     } else {
       pulseAnim.setValue(1);
     }
-  }, [isPressing, isTriggered, disabled]);
+  }, [isPressing, isTriggered, disabled, pulseAnim]);
 
   const handlePressIn = () => {
     if (disabled || isTriggered) return;
@@ -75,7 +76,6 @@ export const SOSButton: React.FC<SOSButtonProps> = ({ onTrigger, disabled, style
   };
 
   const handlePressOut = () => {
-    if (disabled || isTriggered) return;
     if (pressTimeout.current) clearTimeout(pressTimeout.current);
     setIsPressing(false);
     
@@ -86,20 +86,15 @@ export const SOSButton: React.FC<SOSButtonProps> = ({ onTrigger, disabled, style
     }).start();
   };
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderGrant: handlePressIn,
-      onPanResponderRelease: handlePressOut,
-      onPanResponderTerminate: handlePressOut,
-    })
-  ).current;
+  useEffect(() => () => {
+    if (pressTimeout.current) clearTimeout(pressTimeout.current);
+  }, []);
 
   const handleTypeSelect = (type: SOSType) => {
     setShowTypeSelector(false);
     onTrigger(type);
-    // Reset after trigger in a real app, typically handled by global state.
-    setTimeout(() => setIsTriggered(false), 5000);
+    setIsTriggered(false);
+    progressAnim.setValue(0);
   };
 
   const progressHeight = progressAnim.interpolate({
@@ -114,17 +109,20 @@ export const SOSButton: React.FC<SOSButtonProps> = ({ onTrigger, disabled, style
           styles.buttonOuter,
           { transform: [{ scale: pulseAnim }] }
         ]}
-        {...panResponder.panHandlers}
+        onStartShouldSetResponder={() => !disabled}
+        onResponderGrant={handlePressIn}
+        onResponderRelease={handlePressOut}
+        onResponderTerminate={handlePressOut}
       >
         <View style={styles.buttonInner}>
           <Animated.View style={[styles.progressFill, { height: progressHeight }]} />
           <Text style={styles.buttonText}>
-            {isTriggered ? 'SENT' : isPressing ? 'HOLD' : 'SOS'}
+            {isTriggered ? 'SELECT' : isPressing ? 'HOLD' : 'SOS'}
           </Text>
         </View>
       </Animated.View>
 
-      <Modal visible={showTypeSelector} transparent animationType="slide">
+      <Modal visible={showTypeSelector} transparent animationType="slide" onRequestClose={() => { setShowTypeSelector(false); setIsTriggered(false); progressAnim.setValue(0); }}>
         <View style={styles.modalContainer}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Select Emergency Type</Text>

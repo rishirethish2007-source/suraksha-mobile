@@ -28,6 +28,8 @@ public class BlePeripheralModule: Module {
     private var currentPayloadData: Data?
     private var cancelPayloadData: Data?
     private var isAdvertising = false
+    private var advertisingPromise: Promise?
+    private var advertisingTimeout: DispatchWorkItem?
 
     public func definition() -> ModuleDefinition {
         Name("BlePeripheral")
@@ -40,22 +42,23 @@ public class BlePeripheralModule: Module {
         )
 
         AsyncFunction("initialize") { (promise: Promise) in
+            if self.peripheralManager != nil { promise.resolve(true); return }
             self.peripheralDelegate = PeripheralDelegate(module: self)
             self.centralDelegate = CentralDelegate(module: self)
 
             self.peripheralManager = CBPeripheralManager(
                 delegate: self.peripheralDelegate,
-                queue: DispatchQueue.global(qos: .userInitiated),
+                queue: DispatchQueue.main,
                 options: [CBPeripheralManagerOptionShowPowerAlertKey: true]
             )
 
             self.centralManager = CBCentralManager(
                 delegate: self.centralDelegate,
-                queue: DispatchQueue.global(qos: .userInitiated)
+                queue: DispatchQueue.main
             )
 
             promise.resolve(true)
-        }
+        }.runOnQueue(.main)
 
         AsyncFunction("startAdvertising") { (payloadBase64: String, promise: Promise) in
             guard let data = Data(base64Encoded: payloadBase64) else {
@@ -63,20 +66,44 @@ public class BlePeripheralModule: Module {
                 return
             }
 
+            guard data.count <= 512 else {
+                promise.reject("BLE_ADV_ERROR", "GATT payload exceeds 512 bytes")
+                return
+            }
+            guard self.advertisingPromise == nil else {
+                promise.reject("BLE_ADV_ERROR", "Advertising is already starting")
+                return
+            }
             self.currentPayloadData = data
-            self.setupAndAdvertise()
+            if self.isAdvertising && self.peripheralManager?.isAdvertising == true {
+                promise.resolve(true)
+                return
+            }
+            self.advertisingPromise = promise
             self.isAdvertising = true
-            promise.resolve(true)
-        }
+            let timeout = DispatchWorkItem { [weak self] in
+                self?.advertisingPromise?.reject("BLE_ADV_TIMEOUT", "Bluetooth advertising timed out")
+                self?.advertisingPromise = nil
+                self?.isAdvertising = false
+                self?.peripheralManager?.stopAdvertising()
+                self?.peripheralManager?.removeAllServices()
+            }
+            self.advertisingTimeout = timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+            self.setupAndAdvertise()
+        }.runOnQueue(.main)
 
         AsyncFunction("stopAdvertising") { (promise: Promise) in
+            self.advertisingTimeout?.cancel()
+            self.advertisingPromise?.reject("BLE_ADV_CANCELLED", "Advertising stopped")
+            self.advertisingPromise = nil
             self.peripheralManager?.stopAdvertising()
             self.peripheralManager?.removeAllServices()
             self.isAdvertising = false
             self.currentPayloadData = nil
             self.cancelPayloadData = nil
             promise.resolve(true)
-        }
+        }.runOnQueue(.main)
 
         AsyncFunction("startScanning") { (promise: Promise) in
             guard let central = self.centralManager, central.state == .poweredOn else {
@@ -89,12 +116,12 @@ public class BlePeripheralModule: Module {
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
             )
             promise.resolve(true)
-        }
+        }.runOnQueue(.main)
 
         AsyncFunction("stopScanning") { (promise: Promise) in
             self.centralManager?.stopScan()
             promise.resolve(true)
-        }
+        }.runOnQueue(.main)
 
         AsyncFunction("broadcastCancellation") { (cancelPayload: String, promise: Promise) in
             guard let data = Data(base64Encoded: cancelPayload) else {
@@ -103,6 +130,13 @@ public class BlePeripheralModule: Module {
             }
             self.cancelPayloadData = data
             promise.resolve(true)
+        }.runOnQueue(.main)
+
+        OnDestroy {
+            self.centralManager?.stopScan()
+            self.peripheralManager?.stopAdvertising()
+            self.peripheralManager?.removeAllServices()
+            self.advertisingTimeout?.cancel()
         }
 
         Function("isSupported") { () -> Bool in
@@ -164,16 +198,31 @@ public class BlePeripheralModule: Module {
 
         func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
             if let error = error {
-                NSLog("[SurakshaBLE] Failed to add service: \(error.localizedDescription)")
+                module?.advertisingTimeout?.cancel()
+                module?.advertisingPromise?.reject("BLE_GATT_ERROR", error.localizedDescription)
+                module?.advertisingPromise = nil
+                module?.isAdvertising = false
                 return
             }
 
+            guard module?.isAdvertising == true else { return }
             // Start advertising with the service UUID
             peripheral.startAdvertising([
                 CBAdvertisementDataServiceUUIDsKey: [BlePeripheralModule.SERVICE_UUID],
                 CBAdvertisementDataLocalNameKey: "Suraksha"
             ])
             NSLog("[SurakshaBLE] Service added, advertising started")
+        }
+
+        func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+            module?.advertisingTimeout?.cancel()
+            if let error = error {
+                module?.isAdvertising = false
+                module?.advertisingPromise?.reject("BLE_ADV_ERROR", error.localizedDescription)
+            } else {
+                module?.advertisingPromise?.resolve(true)
+            }
+            module?.advertisingPromise = nil
         }
 
         func peripheralManager(
@@ -233,9 +282,23 @@ public class BlePeripheralModule: Module {
             ])
 
             // Connect to read payload
+            guard !connectedPeripherals.contains(where: { $0.identifier == peripheral.identifier }) else { return }
             peripheral.delegate = self
             connectedPeripherals.append(peripheral)
             central.connect(peripheral, options: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self, weak peripheral] in
+                guard let peripheral = peripheral,
+                    self?.connectedPeripherals.contains(where: { $0.identifier == peripheral.identifier }) == true else { return }
+                central.cancelPeripheralConnection(peripheral)
+                self?.connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
+            }
+        }
+
+        func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+            connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
+        }
+        func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+            connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
         }
 
         func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -259,9 +322,9 @@ public class BlePeripheralModule: Module {
             error: Error?
         ) {
             guard let chars = service.characteristics else { return }
-            for char in chars {
-                peripheral.readValue(for: char)
-            }
+            if let characteristic = chars.first(where: { $0.uuid == BlePeripheralModule.SOS_CHAR_UUID }) {
+                peripheral.readValue(for: characteristic)
+            } else { module?.centralManager?.cancelPeripheralConnection(peripheral) }
         }
 
         func peripheral(
@@ -269,7 +332,11 @@ public class BlePeripheralModule: Module {
             didUpdateValueFor characteristic: CBCharacteristic,
             error: Error?
         ) {
-            guard let data = characteristic.value else { return }
+            defer {
+                module?.centralManager?.cancelPeripheralConnection(peripheral)
+                connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
+            }
+            guard error == nil, let data = characteristic.value else { return }
             let base64 = data.base64EncodedString()
 
             NSLog("[SurakshaBLE] Read \(data.count) bytes from \(peripheral.identifier)")

@@ -1,56 +1,55 @@
-# Welcome to your Expo app 👋
+# Suraksha mobile
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Expo SDK 57 / React Native SOS client for the companion [backend](https://github.com/rishirethish2007-source/suraksha-backend).
 
-## Get started
+## Setup
 
-1. Install dependencies
+Use Node.js 22.13+ (Node 24 recommended).
 
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```sh
+npm ci
+cp .env.example .env
+# Set EXPO_PUBLIC_API_URL to the reachable backend origin, without /api/v1.
+npm start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+The home screen asks for your user ID, name, phone, and session token instead of sending hardcoded test identities and coordinates. The session token is held in memory; it is not persisted or broadcast over BLE. User sign-in must be connected to your identity provider before production use. `userId` must equal the JWT's `sub`. See the backend README for issuer, audience, and roles/scopes. Do not place credentials in `EXPO_PUBLIC_*` variables: those are bundled into the app.
 
-### Other setup steps
+Location permission is required. The app obtains real coordinates through Expo Location and can use a recent cached fix if current GPS times out. It never silently substitutes Mumbai or (0, 0).
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+## Delivery states
 
-## Learn more
+- **Received by server** means the API explicitly returned success.
+- **Bluetooth advertising** means the native advertising callback succeeded; it does not confirm that another device or the backend received the alert.
+- **Saved on this device** means a durable retry entry exists, with no confirmed delivery.
 
-To learn more about developing your project with Expo, look at the following resources:
+Pending alerts retry on reconnect and periodically while the screen is mounted. Expired alerts are not resent. Queued cancellations take priority over alerts and retry until confirmed. The app cannot promise retries while terminated; no background worker/foreground Android service has been implemented.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+The **Enable nearby relay** control starts foreground scanning. An online relay gateway needs a token with the backend's `sos:relay` scope. BLE-origin identities remain unverified and nearby alerts are labelled accordingly. Never assume an unsigned received BLE packet is authenticated.
 
-## Join the community
+## Native BLE builds
 
-Join our community of developers creating universal apps.
+Expo Go and web do not contain the local native module. They can use online delivery and durable queues, but cannot advertise or scan. Build the app to enable Bluetooth:
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+```sh
+npm run android
+npm run ios
+```
+
+Use EAS builds if local Android/Xcode tooling is unavailable. The local module in `modules/ble-peripheral` includes Android Gradle/manifest and iOS podspec metadata for Expo autolinking. SDK defaults choose Kotlin/compile tooling; no outdated Kotlin override is applied.
+
+The versioned BLE packet uses a compact JSON array and is limited to the standard 512-byte GATT value. It includes core identity, position, timestamp, TTL, hop count, and compact relay history; optional detailed location metadata/media references are not transported. Oversized alerts remain queued for online delivery instead of being silently truncated. Both platforms use the same service UUIDs. This packet format is incompatible with the old simulated JavaScript bridge.
+
+Local cancellation stops advertising and is sent through the authenticated API. Unsigned BLE cancellation messages are deliberately not honored, since they could suppress someone else's SOS. A received relay may continue displaying until its TTL; the backend tombstone prevents cancelled alerts from being re-created after confirmed cancellation.
+
+## Checks
+
+```sh
+npm run typecheck
+npm run lint
+npm test
+npx expo install --check
+npx expo export --platform web
+```
+
+Tests exercise actual TypeScript services with mocked device/network/storage boundaries: API field mapping, server errors, nearby queries, BLE encoding/validation, concurrent queue writes, retries, cancellation persistence, and expiry. Web export and native autolinking checks do not replace an Android/iOS native build or physical two-phone BLE tests. Test denied permissions, disabled Bluetooth, disconnections, multi-hop delivery, cancellation, GPS failure, app termination, and reconnect behavior before relying on the app in an emergency.

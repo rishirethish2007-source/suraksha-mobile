@@ -3,13 +3,13 @@
  */
 
 // Custom 128-bit Service UUID for Suraksha SOS Discovery
-export const SURAKSHA_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
+export const SURAKSHA_SERVICE_UUID = '8fc9a2e0-1b2a-4c3d-9e5f-0a1b2c3d4e5f';
 
 // Characteristic UUID for reading the full SOS payload
-export const SURAKSHA_SOS_CHARACTERISTIC_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
+export const SURAKSHA_SOS_CHARACTERISTIC_UUID = '8fc9a2e1-1b2a-4c3d-9e5f-0a1b2c3d4e5f';
 
 // Characteristic UUID for reading cancellation payloads
-export const SURAKSHA_CANCEL_CHARACTERISTIC_UUID = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
+export const SURAKSHA_CANCEL_CHARACTERISTIC_UUID = '8fc9a2e2-1b2a-4c3d-9e5f-0a1b2c3d4e5f';
 
 // Maximum times a single message can be relayed to prevent mesh flooding
 export const MAX_HOP_COUNT = 15;

@@ -2,6 +2,8 @@
  * @fileoverview Network service to check for active internet connectivity.
  */
 
+import { apiUrl } from '../constants/api';
+
 import NetInfo, { NetInfoState, NetInfoSubscription } from '@react-native-community/netinfo';
 
 export class NetworkService {
@@ -46,20 +48,20 @@ export class NetworkService {
    * to confirm reachability.
    */
   private static async pingServer(): Promise<boolean> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
       
-      const response = await fetch('https://1.1.1.1', {
-        method: 'HEAD',
+      const response = await fetch(apiUrl('/health'), {
+        method: 'GET',
         signal: controller.signal,
         cache: 'no-store'
       });
       
       clearTimeout(timeoutId);
       return response.ok;
-    } catch (e) {
+    } catch {
       return false;
-    }
+    } finally { clearTimeout(timeoutId); }
   }
 }

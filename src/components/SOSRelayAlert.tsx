@@ -2,14 +2,13 @@
  * @fileoverview Modal alert displayed when a relay node receives an SOS.
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   Modal,
-  TouchableOpacity,
-  Animated
+  TouchableOpacity
 } from 'react-native';
 import { ActiveSOSEvent } from '../interfaces/sos.types';
 
@@ -26,10 +25,15 @@ export const SOSRelayAlert: React.FC<SOSRelayAlertProps> = ({
   onDismiss,
   onHelp
 }) => {
-  const timeSince = Math.floor((Date.now() - new Date(sosEvent.timestamp).getTime()) / 60000);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 10000);
+    return () => clearInterval(timer);
+  }, []);
+  const timeSince = Math.max(0, Math.floor((now - Date.parse(sosEvent.timestamp)) / 60000));
   
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onDismiss}>
       <View style={styles.overlay}>
         <View style={styles.alertBox}>
           <View style={styles.header}>
