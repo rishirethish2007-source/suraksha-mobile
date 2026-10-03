@@ -4,6 +4,7 @@ import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import { establishSession, oidcIssuer, oidcClient, Session } from '../services/session.service';
 import { enrollDevice } from '../services/origin-security';
+import { API_ORIGIN } from '../constants/api';
 import { SOSTriggerService } from '../services/sos-trigger.service';
 WebBrowser.maybeCompleteAuthSession();
 
@@ -33,8 +34,12 @@ export function AuthPanel({ onSession }: { onSession: (session: Session) => void
     finally { setBusy(false); }
   }
   return <View style={{ padding: 16, gap: 8 }}>
-    <Button title="Sign in to Suraksha" disabled={busy} onPress={login} />
+    {oidcIssuer && oidcClient ? <Button title="Sign in to Suraksha" disabled={busy} onPress={login} /> :
+      process.env.EXPO_PUBLIC_ENABLE_TEST_LOGIN !== 'true' && <Text style={{ color: '#ff9b90' }}>This build has no login provider configured. Install a configured build.</Text>}
     {process.env.EXPO_PUBLIC_ENABLE_TEST_LOGIN === 'true' && <>
+      <Text style={{ color: '#fff', fontWeight: 'bold' }}>Local test-account sign-in</Text>
+      <Text selectable style={{ color: '#ddd' }}>Backend: {API_ORIGIN}</Text>
+      <Text style={{ color: '#ddd' }}>Keep your laptop backend running and both devices on the same Wi-Fi. Paste a phone token from dev-tokens.json on your laptop.</Text>
       <TextInput accessibilityLabel="Local test token" secureTextEntry autoCapitalize="none" value={testToken} onChangeText={setTestToken}
         placeholder="Paste a local test token" placeholderTextColor="#aaa" style={{ color: '#fff', padding: 10, borderWidth: 1, borderColor: '#888' }} />
       <Button title="Connect test account and enroll device" disabled={busy} onPress={async () => {

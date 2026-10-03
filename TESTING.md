@@ -87,3 +87,12 @@ npx expo export --platform all
 ```
 
 Tests cover authentication/ownership, deduplication, cancellations, TTL, spatial lookup, outbox publication, packet limits, signature tampering and durable forwarding. CI additionally compiles Android native code; successful JS tests/export do not prove native compilation or radio interoperability. Physical radio/background behavior and production OIDC/CA configuration remain deployment acceptance gates.
+
+
+## Preconfigured local test APK
+
+The **Local test APK** GitHub Actions workflow produces an installable, ARM64 Android APK with embedded JavaScript. Download the `suraksha-local-test-apk` artifact from a successful run and extract `suraksha-local-test.apk`. It installs separately as **Suraksha Test** (`com.suraksha.emergency.localtest`). It is locally/debug signed for testing, not a production/store release.
+
+The initial build connects to `http://172.18.67.184:8000`. Keep the updated backend running on that laptop with `uvicorn app.main:app --host 0.0.0.0 --port 8000`. Both devices must be on a network that permits reaching that address. Paste the phone-a token from that backend's generated `dev-tokens.json`, then tap **Connect test account and enroll device**. No tokens or signing secrets are bundled in the APK. If `/api/v1/identity/me` is missing, update the backend; an older `/docs` page alone does not mean the signed-device API is available.
+
+Local HTTP is deliberately allowed only in this explicitly selected native test configuration. Do not use it for real emergencies or real account credentials. The normal app configuration remains unchanged. If the laptop IP changes, run the workflow manually with the new backend URL and install its new artifact. This does not configure or launch the backend on your PC.
