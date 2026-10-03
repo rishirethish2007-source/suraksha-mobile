@@ -8,29 +8,38 @@ import {
   TouchableOpacity,
   Modal,
   Vibration,
-  TextInput,
   ScrollView,
+  Linking,
+  Alert,
 } from 'react-native';
 
 // ── Config ──────────────────────────────────────────────────────
 import { SOSTriggerService } from '../services/sos-trigger.service';
 import { SOSApiService } from '../services/sos-api.service';
+import { AuthPanel } from '../components/AuthPanel';
+import { Session, loadSession, signOut } from '../services/session.service';
+import { setRelayEnabled, isRelayEnabled } from '../services/mesh-runtime.service';
 import { useBLEMesh } from '../hooks/useBLEMesh';
-import { NetworkService } from '../services/network.service';
 import { DeliveryMethod, SOSType, SOSPayload } from '../interfaces/sos.types';
 
 const SOS_TYPES = Object.values(SOSType);
 
 const LONG_PRESS_MS = 3000;
 
-function RelayPanel({ deviceId }: { deviceId: string }) {
+function RelayPanel({ deviceId, userId }: { deviceId: string; userId: string }) {
   const { isScanning, nearbySOSEvents, error } = useBLEMesh(deviceId);
-  return <View style={{ padding: 16 }}>
-    <Text style={{ color: '#ddd' }}>{isScanning ? 'Scanning for nearby SOS alerts' : 'Starting Bluetooth…'}</Text>
+  return <View style={{ padding: 16, gap: 12 }}>
+    <Text style={{ color: '#ddd' }}>{isScanning ? 'Nearby relay enabled' : 'Nearby SOS alerts'}</Text>
     {error && <Text style={{ color: '#ff9b90' }}>{error}</Text>}
-    {nearbySOSEvents.map(event => <Text key={event.sosId} style={{ color: '#fff', marginTop: 8 }}>
-      Nearby {event.sosType}: {event.userName}. Received over Bluetooth; origin is unverified.
-    </Text>)}
+    {nearbySOSEvents.map(event => <View key={event.sosId} style={{ padding: 12, borderWidth: 1, borderColor: '#f66' }}>
+      <Text style={{ color: '#fff' }}>{event.sosType}: {event.userName} needs help.</Text>
+      <Text style={{ color: '#ddd' }}>{event.distanceMeters == null ? 'Distance unavailable' : `${Math.round(event.distanceMeters)} m away`} · {event.location.latitude.toFixed(5)}, {event.location.longitude.toFixed(5)}</Text>
+      <TouchableOpacity onPress={() => { void Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${event.location.latitude},${event.location.longitude}`).catch(() => Alert.alert('Unable to open maps')); }}><Text style={{ color: '#7af', padding: 8 }}>View location</Text></TouchableOpacity>
+      <TouchableOpacity onPress={async () => {
+        try { await SOSApiService.respond(event.sosId, userId); Alert.alert('Response recorded', 'The server has recorded that you are on your way.'); }
+        catch (error) { Alert.alert('Response not confirmed', error instanceof Error ? error.message : 'Reconnect and try again.'); }
+      }}><Text style={{ color: '#7af', padding: 8 }}>I can help — mark me en route</Text></TouchableOpacity>
+    </View>)}
   </View>;
 }
 
@@ -40,22 +49,17 @@ export default function Index() {
   const [showPicker, setShowPicker] = useState(false);
   const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'queued' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
-  const [userId, setUserId] = useState('');
-  const [userName, setUserName] = useState('');
-  const [userPhone, setUserPhone] = useState('');
-  const [token, setToken] = useState('');
+  const [relayDevice, setRelayDevice] = useState<string | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const userId = session?.user.user_id ?? '';
+  const userName = session?.user.name ?? '';
+  const userPhone = session?.user.phone ?? '';
+  useEffect(() => {
+    void loadSession().then(setSession);
+    void isRelayEnabled().then(enabled => { if (enabled) void SOSTriggerService.getDeviceId().then(setRelayDevice); });
+  }, []);
   const [lastSOS, setLastSOS] = useState<SOSPayload | null>(null);
   const sending = useRef(false);
-  const [relayDevice, setRelayDevice] = useState<string | null>(null);
-  useEffect(() => {
-    SOSApiService.setAuthToken(token.trim() || undefined);
-    const retry = () => { void SOSTriggerService.retryPendingQueue().catch(() => undefined); };
-    retry();
-    const unsubscribe = NetworkService.subscribe(online => { if (online) retry(); });
-    const timer = setInterval(retry, 30000);
-    return () => { unsubscribe(); clearInterval(timer); };
-  }, [token]);
-
   const [pulseAnim] = useState(() => new Animated.Value(1));
   const [progressAnim] = useState(() => new Animated.Value(0));
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -104,7 +108,7 @@ export default function Index() {
     setStatusMsg('Acquiring your location and sending SOS…');
     try {
       const payload = await SOSTriggerService.triggerSOS({ userId, userName, userPhone,
-        authToken: token.trim() || undefined, sosType: type });
+        sosType: type });
       setLastSOS(payload);
       if (payload.deliveryMethod === DeliveryMethod.DIRECT_ONLINE) {
         setStatus('sent');
@@ -128,7 +132,7 @@ export default function Index() {
     if (!lastSOS || sending.current) return;
     sending.current = true;
     try {
-      const confirmed = await SOSTriggerService.cancelSOS(lastSOS.sosId, lastSOS.userId, undefined, token.trim() || undefined);
+      const confirmed = await SOSTriggerService.cancelSOS(lastSOS.sosId, lastSOS.userId, undefined);
       setStatus(confirmed ? 'idle' : 'queued');
       setStatusMsg(confirmed ? 'SOS cancellation confirmed by server.' : 'Cancellation saved. Server confirmation is pending.');
       setLastSOS(null);
@@ -149,18 +153,17 @@ export default function Index() {
       <ScrollView contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>🛡️ Suraksha</Text>
       <Text style={styles.subtitle}>Emergency Response Network</Text>
-      <View style={{ paddingHorizontal: 20, gap: 8 }}>
-        <TextInput accessibilityLabel="User ID" style={styles.input} placeholder="User ID from your account" placeholderTextColor="#888" value={userId} onChangeText={setUserId} autoCapitalize="none" />
-        <TextInput accessibilityLabel="Name" style={styles.input} placeholder="Your name" placeholderTextColor="#888" value={userName} onChangeText={setUserName} />
-        <TextInput accessibilityLabel="Phone" style={styles.input} placeholder="Phone number" placeholderTextColor="#888" value={userPhone} onChangeText={setUserPhone} keyboardType="phone-pad" />
-        <TextInput accessibilityLabel="Session token" style={styles.input} placeholder="Session token (until sign-in is integrated)" placeholderTextColor="#888" value={token} onChangeText={setToken} autoCapitalize="none" secureTextEntry />
-      </View>
-
-      <TouchableOpacity style={styles.cancelBtn} onPress={() => {
-        if (relayDevice) setRelayDevice(null);
-        else void SOSTriggerService.getDeviceId().then(setRelayDevice).catch(() => setStatusMsg('Unable to initialize this device.'));
+      {!session ? <AuthPanel onSession={setSession} /> : <View style={{ padding: 16 }}>
+        <Text style={styles.statusText}>Signed in as {session.user.name}</Text>
+        <TouchableOpacity onPress={async () => { await setRelayEnabled(false); await signOut(); SOSApiService.setAuthToken(undefined); setRelayDevice(null); setSession(null); }}><Text style={styles.statusText}>Sign out</Text></TouchableOpacity>
+      </View>}
+      <TouchableOpacity style={styles.cancelBtn} onPress={async () => {
+        try {
+          await setRelayEnabled(!relayDevice);
+          setRelayDevice(relayDevice ? null : await SOSTriggerService.getDeviceId());
+        } catch (error) { setStatusMsg(error instanceof Error ? error.message : 'Unable to enable nearby relay.'); }
       }}><Text style={styles.statusText}>{relayDevice ? 'Stop nearby relay' : 'Enable nearby relay'}</Text></TouchableOpacity>
-      {relayDevice && <RelayPanel deviceId={relayDevice} />}
+      {session && <RelayPanel deviceId={relayDevice ?? ''} userId={userId} />}
       {/* ── SOS Button ── */}
       <View style={styles.center}>
         <Animated.View

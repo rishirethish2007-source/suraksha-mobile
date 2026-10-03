@@ -1,469 +1,321 @@
 package com.suraksha.bleperipheral
 
 import android.Manifest
+import android.app.*
 import android.bluetooth.*
 import android.bluetooth.le.*
-import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import java.util.concurrent.ConcurrentHashMap
-import android.os.ParcelUuid
+import android.content.*
+import android.os.*
 import android.util.Base64
-import android.util.Log
-import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import com.facebook.react.HeadlessJsTaskService
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.jstasks.HeadlessJsTaskConfig
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.kotlin.Promise
+import org.json.JSONArray
+import java.io.ByteArrayOutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
-/**
- * Native Android BLE Peripheral Module for Suraksha SOS Mesh Network.
- *
- * This module handles:
- * 1. BLE Advertising — Broadcasts the Suraksha Service UUID so nearby phones can discover this device.
- * 2. GATT Server — Hosts characteristics containing the full SOS payload (up to 512 bytes).
- *    When a scanning device connects and reads the characteristic, it gets the complete SOS data.
- * 3. BLE Scanning — Discovers nearby Suraksha devices and reads their SOS payloads.
- */
+/** Native transport remains owned by the foreground service, not a React screen. */
+internal object MeshRuntime {
+    var engine: MeshEngine? = null
+    var listener: ((String, Map<String, Any>) -> Unit)? = null
+    fun get(context: Context): MeshEngine = synchronized(this) {
+        engine ?: MeshEngine(context.applicationContext).also { engine = it }
+    }
+}
+
 class BlePeripheralModule : Module() {
-
-    companion object {
-        private const val TAG = "SurakshaBLE"
-
-        // Must match frontend constants in ble.constants.ts
-        val SERVICE_UUID: UUID = UUID.fromString("8fc9a2e0-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
-        val SOS_CHAR_UUID: UUID = UUID.fromString("8fc9a2e1-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
-        val CANCEL_CHAR_UUID: UUID = UUID.fromString("8fc9a2e2-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
-    }
-
-    private var bluetoothAdapter: BluetoothAdapter? = null
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var gattServer: BluetoothGattServer? = null
-    private var isAdvertising = false
-    private var currentPayloadBase64: String? = null
-    private var cancelPayloadBase64: String? = null
-    private var scanner: BluetoothLeScanner? = null
-    private var isScanning = false
-    private var advertisingPromise: Promise? = null
-    private val handler = Handler(Looper.getMainLooper())
-    private val connectedDevices = ConcurrentHashMap<String, BluetoothGatt>()
-    private val readMtu = ConcurrentHashMap<String, Int>()
-    private val advertisingTimeout = Runnable {
-        advertisingPromise?.reject("BLE_ADV_TIMEOUT", "Bluetooth advertising timed out", null)
-        advertisingPromise = null
-        stopBleAdvertising()
-        stopGattServer()
-        isAdvertising = false
-    }
-
     override fun definition() = ModuleDefinition {
         Name("BlePeripheral")
-
-        // ──────────────────────────────────────────────────────────
-        //  Events emitted to JavaScript
-        // ──────────────────────────────────────────────────────────
-        Events(
-            "onSOSReceived",      // Payload read from a nearby device via GATT
-            "onCancelReceived",   // Cancellation payload received
-            "onDeviceDiscovered", // A Suraksha device was found during scan
-            "onError"             // Error occurred
-        )
-
-        // ──────────────────────────────────────────────────────────
-        //  initialize()
-        //  Sets up BluetoothAdapter and checks BLE Peripheral support.
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("initialize") { promise: Promise ->
-            try {
-                val context = appContext.reactContext ?: throw Exception("No context")
-                val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-                    ?: throw Exception("BluetoothManager not available")
-
-                bluetoothAdapter = manager.adapter
-                if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) {
-                    throw Exception("Bluetooth is not enabled")
-                }
-
-                if (!bluetoothAdapter!!.isMultipleAdvertisementSupported) {
-                    Log.w(TAG, "Device does not support BLE advertising (peripheral mode)")
-                    throw Exception("BLE Peripheral mode not supported on this device")
-                }
-
-                advertiser = bluetoothAdapter!!.bluetoothLeAdvertiser
-                scanner = bluetoothAdapter!!.bluetoothLeScanner
-
-                Log.i(TAG, "BLE Peripheral Module initialized successfully")
-                promise.resolve(true)
-            } catch (e: Exception) {
-                Log.e(TAG, "Init failed: ${e.message}")
-                promise.reject("BLE_INIT_ERROR", e.message, e)
-            }
+        Events("onSOSReceived", "onCancelReceived", "onDeviceDiscovered", "onError")
+        OnCreate { MeshRuntime.listener = { name, body -> sendEvent(name, body) } }
+        OnDestroy { MeshRuntime.listener = null } // The service deliberately survives React teardown.
+        AsyncFunction("initialize") { MeshRuntime.get(requireContext()).checkBluetooth(); true }
+        AsyncFunction("startAdvertising") { payload: String, promise: Promise ->
+            MeshRuntime.get(requireContext()).advertise(payload, promise)
         }
-
-        // ──────────────────────────────────────────────────────────
-        //  startAdvertising(payloadBase64: String)
-        //  Starts BLE advertising + GATT server hosting the SOS payload.
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("startAdvertising") { payloadBase64: String, promise: Promise ->
-            try {
-                if (Base64.decode(payloadBase64, Base64.DEFAULT).size > 512) {
-                    throw Exception("GATT payload exceeds 512 bytes")
-                }
-                if (advertisingPromise != null) throw Exception("Advertising is already starting")
-                if (isAdvertising) {
-                    currentPayloadBase64 = payloadBase64
-                    promise.resolve(true)
-                    return@AsyncFunction
-                }
-
-                if (advertiser == null) throw Exception("Bluetooth is not initialized")
-                currentPayloadBase64 = payloadBase64
-                advertisingPromise = promise
-                handler.postDelayed(advertisingTimeout, 10000)
-                startGattServer() // Advertising begins only after onServiceAdded.
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Advertising failed: ${e.message}")
-                handler.removeCallbacks(advertisingTimeout)
-                advertisingPromise = null
-                stopGattServer()
-                promise.reject("BLE_ADV_ERROR", e.message, e)
-            }
+        AsyncFunction("removeAdvertisement") { id: String -> MeshRuntime.get(requireContext()).removeAdvertisement(id) }
+        AsyncFunction("stopAdvertising") { MeshRuntime.get(requireContext()).stopAdvertising(); true }
+        AsyncFunction("startScanning") {
+            val context = requireContext()
+            MeshRuntime.get(context).checkBluetooth()
+            val intent = Intent(context, MeshForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
+            MeshRuntime.get(context).startScanning()
+            true
         }
-
-        // ──────────────────────────────────────────────────────────
-        //  stopAdvertising()
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("stopAdvertising") { promise: Promise ->
-            try {
-                handler.removeCallbacks(advertisingTimeout)
-                advertisingPromise?.reject("BLE_ADV_CANCELLED", "Advertising stopped", null)
-                advertisingPromise = null
-                stopBleAdvertising()
-                stopGattServer()
-                isAdvertising = false
-                currentPayloadBase64 = null
-                cancelPayloadBase64 = null
-
-                Log.i(TAG, "Advertising stopped")
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("BLE_STOP_ERROR", e.message, e)
-            }
+        AsyncFunction("stopScanning") {
+            val context = requireContext()
+            context.stopService(Intent(context, MeshForegroundService::class.java))
+            MeshRuntime.get(context).stopScanning()
+            true
         }
-
-        // ──────────────────────────────────────────────────────────
-        //  startScanning()
-        //  Scans for nearby Suraksha SOS devices and reads their payload.
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("startScanning") { promise: Promise ->
-            try {
-                if (isScanning || scanner == null) {
-                    promise.resolve(false)
-                    return@AsyncFunction
-                }
-
-                val filters = listOf(
-                    ScanFilter.Builder()
-                        .setServiceUuid(ParcelUuid(SERVICE_UUID))
-                        .build()
-                )
-                val settings = ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                    .build()
-
-                scanner!!.startScan(filters, settings, scanCallback)
-                isScanning = true
-                Log.i(TAG, "BLE scanning started")
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("BLE_SCAN_ERROR", e.message, e)
-            }
-        }
-
-        // ──────────────────────────────────────────────────────────
-        //  stopScanning()
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("stopScanning") { promise: Promise ->
-            try {
-                if (isScanning && scanner != null) {
-                    scanner!!.stopScan(scanCallback)
-                    isScanning = false
-                    Log.i(TAG, "BLE scanning stopped")
-                }
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("BLE_SCAN_STOP_ERROR", e.message, e)
-            }
-        }
-
-        // ──────────────────────────────────────────────────────────
-        //  broadcastCancellation(cancelPayloadBase64: String)
-        // ──────────────────────────────────────────────────────────
-        AsyncFunction("broadcastCancellation") { cancelPayload: String, promise: Promise ->
-            try {
-                cancelPayloadBase64 = cancelPayload
-                // Update GATT characteristic if server is running
-                updateGattCharacteristic(CANCEL_CHAR_UUID, cancelPayload)
-                Log.i(TAG, "Cancellation broadcast updated")
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("BLE_CANCEL_ERROR", e.message, e)
-            }
-        }
-
-        // ──────────────────────────────────────────────────────────
-        //  isSupported() -> Boolean
-        // ──────────────────────────────────────────────────────────
-        OnDestroy {
-            handler.removeCallbacksAndMessages(null)
-            if (isScanning) scanner?.stopScan(scanCallback)
-            stopBleAdvertising()
-            stopGattServer()
-            connectedDevices.values.forEach { it.disconnect(); it.close() }
-            connectedDevices.clear()
-            readMtu.clear()
-        }
-
+        AsyncFunction("broadcastCancellation") { _: String -> false }
+        AsyncFunction("getInbox") { MeshRuntime.get(requireContext()).inbox() }
+        AsyncFunction("acknowledgeInbox") { packet: String -> MeshRuntime.get(requireContext()).acknowledge(packet) }
         Function("isSupported") {
-            val adapter = BluetoothAdapter.getDefaultAdapter()
-            adapter != null && adapter.isMultipleAdvertisementSupported
+            (requireContext().getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter?.isMultipleAdvertisementSupported == true
         }
     }
+    private fun requireContext(): Context = appContext.reactContext ?: throw IllegalStateException("React context unavailable")
+}
 
-    // ══════════════════════════════════════════════════════════════
-    //  GATT Server — Hosts SOS payload for connecting Central devices
-    // ══════════════════════════════════════════════════════════════
-
-    private fun startGattServer() {
-        val context = appContext.reactContext ?: throw Exception("No context")
-        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: throw Exception("No Bluetooth manager")
-        gattServer = manager.openGattServer(context, gattServerCallback) ?: throw Exception("Cannot open GATT server")
-
-        val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-
-        // SOS Characteristic — readable by Central devices
-        val sosChar = BluetoothGattCharacteristic(
-            SOS_CHAR_UUID,
-            BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ
-        )
-        service.addCharacteristic(sosChar)
-
-        // Cancel Characteristic
-        val cancelChar = BluetoothGattCharacteristic(
-            CANCEL_CHAR_UUID,
-            BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ
-        )
-        service.addCharacteristic(cancelChar)
-
-        if (gattServer?.addService(service) != true) throw Exception("Cannot add GATT service")
-        Log.i(TAG, "GATT Server started with SOS + Cancel characteristics")
+/** Android 14+ connectedDevice foreground service. Start only from explicit foreground opt-in. */
+class MeshForegroundService : Service() {
+    private val handler = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            try { startService(Intent(this@MeshForegroundService, MeshRelayTaskService::class.java)) }
+            catch (_: Exception) { /* Durable inbox is retried on next tick or app launch. */ }
+            handler.postDelayed(this, 30000)
+        }
     }
-
-    private fun stopGattServer() {
-        gattServer?.close()
-        gattServer = null
+    override fun onCreate() {
+        super.onCreate()
+        val notifications = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= 26) notifications.createNotificationChannel(NotificationChannel("suraksha-relay", "Nearby emergency relay", NotificationManager.IMPORTANCE_LOW))
+        val launch = packageManager.getLaunchIntentForPackage(packageName)
+        val notification = NotificationCompat.Builder(this, "suraksha-relay")
+            .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Suraksha nearby relay is active")
+            .setContentText("Scanning for emergency alerts. Open Suraksha to stop.").setOngoing(true)
+            .setContentIntent(launch?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }).build()
+        if (Build.VERSION.SDK_INT >= 29) startForeground(7310, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        else startForeground(7310, notification)
+        handler.post(tick)
     }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try { MeshRuntime.get(this).startScanning(); MeshRuntime.get(this).resumeAdvertisements() }
+        catch (error: Exception) {
+            MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Bluetooth unavailable")))
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        MeshRuntime.engine?.stopScanning()
+        super.onDestroy()
+    }
+    override fun onBind(intent: Intent?): IBinder? = null
+}
 
-    private fun updateGattCharacteristic(charUuid: UUID, base64Data: String) {
-        gattServer?.services?.forEach { service ->
-            service.getCharacteristic(charUuid)?.let { char ->
-                char.value = Base64.decode(base64Data, Base64.DEFAULT)
+/** Wakes JS for verified notifications, API forwarding and durable retry processing. */
+class MeshRelayTaskService : HeadlessJsTaskService() {
+    override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig =
+        HeadlessJsTaskConfig("SurakshaRelay", Arguments.createMap(), 120000, true)
+}
+
+internal class MeshEngine(private val context: Context) {
+    companion object {
+        val SERVICE: UUID = UUID.fromString("8fc9a2e0-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
+        val DATA: UUID = UUID.fromString("8fc9a2e1-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
+        const val MAX_BYTES = 16384
+    }
+    private val adapter get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: throw IllegalStateException("Bluetooth unsupported")
+    private val handler = Handler(Looper.getMainLooper())
+    private val prefs = context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE)
+    private var scanning = false
+    private var advertising = false
+    private var server: BluetoothGattServer? = null
+    private var payload = ByteArray(0)
+    private var pending: Promise? = null
+    private var starting = false
+    private val packets = linkedMapOf<String, ByteArray>()
+    private var rotationIndex = 0
+    private val rotate = object : Runnable {
+        override fun run() {
+            synchronized(this@MeshEngine) {
+                val now = System.currentTimeMillis()
+                packets.entries.removeAll { expires(it.value) <= now }
+                persistPackets()
+                if (packets.isEmpty()) { stopAdvertising(); return }
+                payload = packets.values.elementAt(rotationIndex++ % packets.size)
             }
+            handler.postDelayed(this, 10000)
         }
     }
-
-    private val gattServerCallback = object : BluetoothGattServerCallback() {
+    private fun expires(bytes: ByteArray): Long {
+        val objectData = org.json.JSONObject(String(bytes, Charsets.UTF_8))
+        return java.time.Instant.parse(objectData.getString("timestamp")).toEpochMilli() + objectData.getLong("ttlSeconds") * 1000
+    }
+    private fun persistPackets() { prefs.edit().putString("adverts", JSONArray(packets.values.map { Base64.encodeToString(it, Base64.NO_WRAP) }).toString()).commit() }
+    @Synchronized fun resumeAdvertisements() {
+        if (advertising || starting) return
+        val saved = JSONArray(prefs.getString("adverts", "[]"))
+        for (index in 0 until saved.length()) {
+            try {
+                val bytes = Base64.decode(saved.getString(index), Base64.DEFAULT)
+                if (expires(bytes) > System.currentTimeMillis()) packets[org.json.JSONObject(String(bytes, Charsets.UTF_8)).getString("sosId")] = bytes
+            } catch (_: Exception) {}
+        }
+        if (packets.isNotEmpty()) { payload = packets.values.first(); beginAdvertising() }
+    }
+    @Synchronized fun removeAdvertisement(id: String) {
+        packets.remove(id); persistPackets()
+        if (packets.isEmpty()) stopAdvertising()
+        else payload = packets.values.first()
+    }
+    private val connections = ConcurrentHashMap<String, BluetoothGatt>()
+    private val cursors = ConcurrentHashMap<String, Int>()
+    private val snapshots = ConcurrentHashMap<String, ByteArray>()
+    private val lastSeen = ConcurrentHashMap<String, Long>()
+    private var advertExpiry: Runnable? = null
+    private val advertTimeout = Runnable { failAdvertising("Advertising timed out") }
+    fun checkBluetooth() { check(adapter?.isEnabled == true) { "Enable Bluetooth to use nearby relay" } }
+    @Synchronized fun inbox(): List<String> {
+        val array = JSONArray(prefs.getString("inbox", "[]"))
+        return (0 until array.length()).map { array.getString(it) }
+    }
+    @Synchronized fun acknowledge(packet: String) { prefs.edit().putString("inbox", JSONArray(inbox().filter { it != packet }).toString()).commit() }
+    @Synchronized private fun received(bytes: ByteArray) {
+        val packet = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val existing = inbox()
+        if (!existing.contains(packet)) {
+            // Bound attacker-controlled storage. Never evict already accepted inbox items.
+            if (existing.size >= 100) return
+            if (!prefs.edit().putString("inbox", JSONArray(existing + packet).toString()).commit()) return
+        }
+        MeshRuntime.listener?.invoke("onSOSReceived", mapOf("payloadBase64" to packet, "deviceId" to "native"))
+        try { context.startService(Intent(context, MeshRelayTaskService::class.java)) } catch (_: Exception) {}
+    }
+    fun startScanning() {
+        checkBluetooth()
+        if (scanning) return
+        adapter.bluetoothLeScanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
+            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scanCallback)
+        scanning = true
+    }
+    fun stopScanning() {
+        try { adapter?.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: SecurityException) {}
+        scanning = false
+        connections.values.forEach { try { it.disconnect(); it.close() } catch (_: Exception) {} }
+        connections.clear()
+    }
+    @Synchronized fun advertise(base64: String, promise: Promise) {
+        try {
+            checkBluetooth()
+            val bytes = Base64.decode(base64, Base64.DEFAULT)
+            check(bytes.isNotEmpty() && bytes.size <= MAX_BYTES) { "Packet must contain 1–16384 bytes" }
+            if (pending != null) { promise.reject("BLE_BUSY", "Advertising is starting", null); return }
+            val id = org.json.JSONObject(String(bytes, Charsets.UTF_8)).getString("sosId")
+            check(expires(bytes) > System.currentTimeMillis()) { "SOS expired" }
+            synchronized(this) {
+                check(packets.size < 100 || packets.containsKey(id)) { "Relay advertising queue is full" }
+                packets[id] = bytes
+                persistPackets()
+            }
+            if (advertising) { promise.resolve(true); return }
+            payload = bytes
+            pending = promise
+            beginAdvertising()
+        } catch (error: Exception) { pending = null; promise.reject("BLE_ADV_ERROR", error.message, error); stopAdvertising() }
+    }
+    private fun beginAdvertising() {
+        starting = true
+        server = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).openGattServer(context, serverCallback)
+        check(server != null) { "GATT server unavailable" }
+        val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+        service.addCharacteristic(BluetoothGattCharacteristic(DATA, BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ))
+        check(server!!.addService(service)) { "Cannot publish GATT service" }
+        handler.postDelayed(advertTimeout, 10000)
+    }
+    @Synchronized fun stopAdvertising() {
+        handler.removeCallbacks(rotate)
+        packets.clear(); persistPackets(); starting = false
+        handler.removeCallbacks(advertTimeout)
+        advertExpiry?.let { handler.removeCallbacks(it) }; advertExpiry = null
+        pending?.reject("BLE_STOPPED", "Advertising stopped", null); pending = null
+        try { adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertCallback) } catch (_: Exception) {}
+        server?.close(); server = null; advertising = false
+        cursors.clear(); snapshots.clear()
+    }
+    private fun failAdvertising(message: String) {
+        pending?.reject("BLE_ADV_ERROR", message, null); pending = null
+        stopAdvertising()
+        MeshRuntime.listener?.invoke("onError", mapOf("error" to message))
+    }
+    private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
-            if (advertisingPromise == null) return
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                try { startBleAdvertising() } catch (error: Exception) {
-                    advertisingPromise?.reject("BLE_ADV_ERROR", error.message, error)
-                    advertisingPromise = null
-                }
-            } else {
-                advertisingPromise?.reject("BLE_GATT_ERROR", "Cannot publish GATT service", null)
-                advertisingPromise = null
-            }
+            if (!starting) return
+            if (status != BluetoothGatt.GATT_SUCCESS) { failAdvertising("Cannot publish GATT service"); return }
+            val settings = AdvertiseSettings.Builder().setConnectable(true).setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER).build()
+            val data = AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).setIncludeDeviceName(false).build()
+            adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, advertCallback) ?: failAdvertising("Peripheral mode unsupported")
         }
-        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
-            readMtu[device.address] = mtu
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, state: Int) {
+            cursors.remove(device.address); snapshots.remove(device.address)
         }
-        override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
-            when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> Log.i(TAG, "GATT: Device connected: ${device?.address}")
-                BluetoothProfile.STATE_DISCONNECTED -> Log.i(TAG, "GATT: Device disconnected: ${device?.address}")
-            }
-        }
-
-        override fun onCharacteristicReadRequest(
-            device: BluetoothDevice?,
-            requestId: Int,
-            offset: Int,
-            characteristic: BluetoothGattCharacteristic?
-        ) {
-            Log.i(TAG, "GATT: Read request for ${characteristic?.uuid}")
-            val data = when (characteristic?.uuid) {
-                SOS_CHAR_UUID -> currentPayloadBase64?.let { Base64.decode(it, Base64.DEFAULT) }
-                CANCEL_CHAR_UUID -> cancelPayloadBase64?.let { Base64.decode(it, Base64.DEFAULT) }
-                else -> null
-            }
-
-            if (data != null && device != null) {
-                if (offset > data.size || offset < 0) {
-                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
-                    return
-                }
-                val end = minOf(data.size, offset + (readMtu[device.address] ?: 23) - 1)
-                val chunk = data.copyOfRange(offset, end)
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, chunk)
-            } else {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, 0, null)
-            }
+        override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
+            if (offset != 0 || characteristic.uuid != DATA) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_INVALID_OFFSET,offset,null); return }
+            if (snapshots.size >= 8 && !snapshots.containsKey(device.address)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
+            val snapshot = snapshots.getOrPut(device.address) { payload.copyOf() }
+            val seq = cursors[device.address] ?: 0
+            val total = (snapshot.size + 11) / 12
+            if (total == 0 || seq >= total) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
+            val chunk = snapshot.copyOfRange(seq * 12, minOf(snapshot.size, (seq+1)*12))
+            // SK, version 2, seq uint16, total uint16, byte count, then <=12 bytes.
+            // A <=20-byte frame works at the minimum ATT MTU and never requires long reads.
+            val frame = byteArrayOf(83,75,2,(seq shr 8).toByte(),seq.toByte(),(total shr 8).toByte(),total.toByte(),chunk.size.toByte()) + chunk
+            server?.sendResponse(device,requestId,BluetoothGatt.GATT_SUCCESS,0,frame)
+            cursors[device.address] = seq + 1
         }
     }
-
-    // ══════════════════════════════════════════════════════════════
-    //  BLE Advertising — Broadcasts Suraksha Service UUID
-    // ══════════════════════════════════════════════════════════════
-
-    private fun startBleAdvertising() {
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setConnectable(true)  // Must be connectable for GATT reads
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setTimeout(0)  // Advertise indefinitely
-            .build()
-
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)  // Save space in adv packet
-            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
-
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+    private val advertCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settings: AdvertiseSettings) { handler.removeCallbacks(advertTimeout); advertising=true; starting=false; pending?.resolve(true); pending=null; handler.removeCallbacks(rotate); handler.post(rotate) }
+        override fun onStartFailure(code: Int) { failAdvertising("Advertising failed: $code") }
     }
-
-    private fun stopBleAdvertising() {
-        advertiser?.stopAdvertising(advertiseCallback)
-    }
-
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-            handler.removeCallbacks(advertisingTimeout)
-            isAdvertising = true
-            advertisingPromise?.resolve(true)
-            advertisingPromise = null
-            Log.i(TAG, "BLE advertising started successfully")
-        }
-
-        override fun onStartFailure(errorCode: Int) {
-            handler.removeCallbacks(advertisingTimeout)
-            isAdvertising = false
-            advertisingPromise?.reject("BLE_ADV_ERROR", "Advertising failed: $errorCode", null)
-            advertisingPromise = null
-            stopGattServer()
-            Log.e(TAG, "BLE advertising failed with error code: $errorCode")
-            sendEvent("onError", mapOf("error" to "Advertising failed: code $errorCode"))
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    //  BLE Scanning — Discovers other Suraksha devices
-    // ══════════════════════════════════════════════════════════════
-
     private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            result?.device?.let { device ->
-                Log.i(TAG, "Discovered Suraksha device: ${device.address}, RSSI: ${result.rssi}")
-                sendEvent("onDeviceDiscovered", mapOf(
-                    "deviceId" to device.address,
-                    "rssi" to result.rssi,
-                    "name" to (device.name ?: "Unknown")
-                ))
-
-                // Auto-connect to read GATT payload
-                connectAndReadPayload(device)
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            isScanning = false
-            Log.e(TAG, "BLE scan failed: $errorCode")
-            sendEvent("onError", mapOf("error" to "Scan failed: code $errorCode"))
+        override fun onScanFailed(code: Int) { scanning=false; MeshRuntime.listener?.invoke("onError", mapOf("error" to "Scanning failed: $code")) }
+        override fun onScanResult(type: Int, result: ScanResult) {
+            val device = result.device
+            val now = System.currentTimeMillis()
+            if (connections.size >= 4 || connections.containsKey(device.address) || now - (lastSeen[device.address] ?: 0) < 65000) return
+            if (lastSeen.size > 1000) lastSeen.clear()
+            lastSeen[device.address] = now
+            connect(device)
         }
     }
-
-    /**
-     * Connects to a discovered Suraksha device, reads the SOS characteristic,
-     * and emits the payload to JavaScript. Disconnects immediately after reading.
-     */
-    private fun connectAndReadPayload(device: BluetoothDevice) {
-        val context = appContext.reactContext ?: return
-
-        if (connectedDevices.containsKey(device.address)) return
-        val connection = device.connectGatt(context, false, object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    connectedDevices.remove(device.address)
-                    gatt.close()
-                } else if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    Log.i(TAG, "Connected to ${device.address}, discovering services...")
-                    gatt.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    connectedDevices.remove(device.address)
-                    gatt.close()
-                }
+    private fun connect(device: BluetoothDevice) {
+        val bytes = ByteArrayOutputStream()
+        var expected = 0
+        var count = -1
+        val gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
+            fun finish(gatt: BluetoothGatt) { connections.remove(device.address); gatt.disconnect(); gatt.close() }
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, state: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) finish(gatt)
+                else if (state == BluetoothProfile.STATE_CONNECTED && !gatt.discoverServices()) finish(gatt)
             }
-
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val service = gatt.getService(SERVICE_UUID)
-                    val sosChar = service?.getCharacteristic(SOS_CHAR_UUID)
-                    if (sosChar != null) {
-                        if (!gatt.readCharacteristic(sosChar)) gatt.disconnect()
-                    } else {
-                        Log.w(TAG, "SOS characteristic not found on ${device.address}")
-                        gatt.disconnect()
-                    }
-                } else { gatt.disconnect() }
+                val char = gatt.getService(SERVICE)?.getCharacteristic(DATA)
+                if (status != BluetoothGatt.GATT_SUCCESS || char == null || !gatt.readCharacteristic(char)) finish(gatt)
             }
-
-            override fun onCharacteristicRead(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                status: Int
-            ) {
-                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.value != null) {
-                    val base64Data = Base64.encodeToString(characteristic.value, Base64.NO_WRAP)
-                    Log.i(TAG, "Read payload from ${device.address}: ${base64Data.length} chars")
-
-                    when (characteristic.uuid) {
-                        SOS_CHAR_UUID -> sendEvent("onSOSReceived", mapOf(
-                            "payloadBase64" to base64Data,
-                            "deviceId" to device.address
-                        ))
-                        CANCEL_CHAR_UUID -> sendEvent("onCancelReceived", mapOf(
-                            "payloadBase64" to base64Data,
-                            "deviceId" to device.address
-                        ))
-                    }
-                }
-                // Disconnect immediately after read
-                gatt.disconnect()
+            @Deprecated("Compatibility callback for Android < 33")
+            override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                consume(gatt, characteristic, characteristic.value ?: ByteArray(0), status)
             }
-        })
-        if (connection != null) {
-            connectedDevices[device.address] = connection
-            handler.postDelayed({
-                if (connectedDevices.remove(device.address, connection)) {
-                    connection.disconnect()
-                    connection.close()
-                }
-            }, 15000)
+            override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+                consume(gatt, characteristic, value, status)
+            }
+            fun consume(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, frame: ByteArray, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS || frame.size < 8 || frame[0].toInt()!=83 || frame[1].toInt()!=75 || frame[2].toInt()!=2) { finish(gatt); return }
+                val seq = ((frame[3].toInt() and 255) shl 8) or (frame[4].toInt() and 255)
+                val total = ((frame[5].toInt() and 255) shl 8) or (frame[6].toInt() and 255)
+                val size = frame[7].toInt() and 255
+                if (seq != expected || total < 1 || total > 1366 || (count != -1 && count != total) || size !in 1..12 || frame.size != 8+size || bytes.size()+size > MAX_BYTES) { finish(gatt); return }
+                count = total; expected++
+                bytes.write(frame,8,size)
+                if (expected == total) { received(bytes.toByteArray()); finish(gatt) }
+                else if (!gatt.readCharacteristic(char)) finish(gatt)
+            }
+        }, BluetoothDevice.TRANSPORT_LE)
+        if (gatt != null) {
+            connections[device.address]=gatt
+            handler.postDelayed({ if(connections.remove(device.address,gatt)) { gatt.disconnect(); gatt.close() } },60000)
         }
     }
 }

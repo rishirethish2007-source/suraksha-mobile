@@ -1,0 +1,52 @@
+import { timedFetch } from './timed-fetch';
+import * as SecureStore from 'expo-secure-store';
+import * as AuthSession from 'expo-auth-session';
+import { Platform } from 'react-native';
+import { apiUrl } from '../constants/api';
+
+export interface Session { accessToken: string; refreshToken?: string; expiresAt: number;
+  user: { user_id: string; name: string; phone: string; role: string }; }
+let current: Session | null = null;
+let refresh: Promise<string | undefined> | null = null;
+const KEY = 'suraksha.session.v1';
+const options = { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY };
+export const oidcIssuer = process.env.EXPO_PUBLIC_OIDC_ISSUER || '';
+export const oidcClient = process.env.EXPO_PUBLIC_OIDC_CLIENT_ID || '';
+
+async function save(session: Session) {
+  current = session;
+  if (Platform.OS !== 'web') await SecureStore.setItemAsync(KEY, JSON.stringify(session), options);
+}
+export async function loadSession(): Promise<Session | null> {
+  if (!current && Platform.OS !== 'web') {
+    const raw = await SecureStore.getItemAsync(KEY, options);
+    if (raw) current = JSON.parse(raw) as Session;
+  }
+  return current;
+}
+export async function establishSession(accessToken: string, refreshToken?: string, expiresIn = 3600): Promise<Session> {
+  const response = await timedFetch(apiUrl('/api/v1/identity/me'), { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) throw new Error('The backend rejected this session. Check issuer, audience and signing key configuration.');
+  const user: Session['user'] = await response.json();
+  const session = { accessToken, refreshToken, user, expiresAt: Date.now() + expiresIn * 1000 };
+  await save(session);
+  return session;
+}
+export async function sessionToken(): Promise<string | undefined> {
+  const session = await loadSession();
+  if (!session) return undefined;
+  if (session.expiresAt > Date.now() + 60000) return session.accessToken;
+  if (!session.refreshToken || !oidcIssuer || !oidcClient) return session.accessToken;
+  if (!refresh) refresh = (async () => {
+    const discovery = await AuthSession.fetchDiscoveryAsync(oidcIssuer);
+    const tokens = await AuthSession.refreshAsync({ clientId: oidcClient, refreshToken: session.refreshToken }, discovery);
+    await save({ ...session, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? session.refreshToken,
+      expiresAt: Date.now() + (tokens.expiresIn ?? 3600) * 1000 });
+    return tokens.accessToken;
+  })().finally(() => { refresh = null; });
+  return refresh;
+}
+export async function signOut(): Promise<void> {
+  current = null;
+  if (Platform.OS !== 'web') await SecureStore.deleteItemAsync(KEY, options);
+}

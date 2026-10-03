@@ -1,3 +1,5 @@
+import { signOrigin } from './origin-security';
+import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LocationService } from './location.service';
 import { NetworkService } from './network.service';
@@ -12,12 +14,7 @@ const CANCEL_KEY = '@suraksha_sos_cancellations';
 const DEVICE_KEY = '@suraksha_device_id';
 export const bleMeshInstance = new BLEMeshService();
 
-function uuid(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const n = Math.floor(Math.random() * 16);
-    return (c === 'x' ? n : (n & 3) | 8).toString(16);
-  });
-}
+function uuid(): string { return Crypto.randomUUID(); }
 
 export class SOSTriggerService {
   // Serialize read-modify-write operations and network retries to prevent lost updates.
@@ -53,6 +50,7 @@ export class SOSTriggerService {
       location, timestamp, createdAt: timestamp, originDeviceId, hopCount: 0, maxHops: MAX_HOP_COUNT,
       relayChain: [], deliveryMethod: DeliveryMethod.OFFLINE_QUEUED, status: SOSStatus.ACTIVE,
       message: params.message, ttlSeconds: SOS_TTL_SECONDS };
+    payload.originProof = await signOrigin(payload);
     return this.exclusive(async () => {
       const queue = await this.read<SOSPayload>(QUEUE_KEY);
       queue.push(payload);
@@ -71,6 +69,7 @@ export class SOSTriggerService {
         }
       }
       try {
+        await bleMeshInstance.requestPermissions();
         await bleMeshInstance.startAdvertising({ ...payload, deliveryMethod: DeliveryMethod.BLE_RELAY });
         return { ...payload, deliveryMethod: DeliveryMethod.BLE_RELAY };
       } catch { return payload; } // Durable queue exists; never report server delivery.
@@ -95,7 +94,18 @@ export class SOSTriggerService {
   public static retryPendingQueue(): Promise<void> {
     return this.exclusive(async () => {
       const { isOnline } = await NetworkService.checkConnectivity();
-      if (!isOnline) return;
+      if (!isOnline) {
+        const cancelledIds = new Set((await this.read<SOSCancellation>(CANCEL_KEY)).map(item => item.sosId));
+        for (const payload of await this.read<SOSPayload>(QUEUE_KEY)) {
+          if (cancelledIds.has(payload.sosId) || !isLivePayload(payload)) {
+            await this.remove(payload.sosId);
+            await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
+          } else {
+            await bleMeshInstance.startAdvertising({ ...payload, authToken: undefined, deliveryMethod: DeliveryMethod.BLE_RELAY }).catch(() => undefined);
+          }
+        }
+        return;
+      }
       const cancellations = await this.read<SOSCancellation>(CANCEL_KEY);
       const cancelledIds = new Set(cancellations.map(item => item.sosId));
       const remainingCancellations = [];

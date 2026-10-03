@@ -1,20 +1,19 @@
 import { PermissionsAndroid, Platform } from 'react-native';
 import * as Peripheral from '../../modules/ble-peripheral';
 import { SOSPayload, SOSCancellation, SOSLocation, DeliveryMethod } from '../interfaces/sos.types';
-import { decodePayload, encodePayload, isLivePayload } from './ble-codec';
-import { DEDUP_CACHE_SIZE } from '../constants/ble.constants';
+import { encodePayload, isLivePayload } from './ble-codec';
 
-type Events = { onSOSReceived: SOSPayload; onError: Error; onRelayComplete: SOSPayload };
+
+type Events = { onInboxReady: undefined; onSOSReceived: SOSPayload; onError: Error; onRelayComplete: SOSPayload };
 
 export class BLEMeshService {
   private listeners: { [K in keyof Events]: Set<(value: Events[K]) => void> } = {
-    onSOSReceived: new Set(), onError: new Set(), onRelayComplete: new Set(),
+    onInboxReady: new Set(), onSOSReceived: new Set(), onError: new Set(), onRelayComplete: new Set(),
   };
   private initialized = false;
   private initializing: Promise<void> | null = null;
   private scanning = false;
   private subscriptions: { remove(): void }[] = [];
-  private seen = new Set<string>();
   private relayTimers = new Set<ReturnType<typeof setTimeout>>();
   private advertisingId: string | null = null;
   private advertisingExpiry: ReturnType<typeof setTimeout> | undefined;
@@ -32,25 +31,9 @@ export class BLEMeshService {
 
   private async initializeNative() {
     if (Platform.OS === 'web') throw new Error('BLE requires a native development build. Online delivery remains available.');
-    if (Platform.OS === 'android') {
-      const permissions = Number(Platform.Version) >= 31 ? [
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN, PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-      ] : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
-      const results = await PermissionsAndroid.requestMultiple(permissions);
-      if (permissions.some(permission => results[permission] !== PermissionsAndroid.RESULTS.GRANTED)) throw new Error('Bluetooth permission denied');
-    }
     if (!(await Peripheral.initialize())) throw new Error('BLE is unavailable. Install a native development build.');
     this.subscriptions = [
-      Peripheral.onSOSReceived(event => {
-        try {
-          const payload = decodePayload(event.payloadBase64);
-          if (this.seen.has(payload.sosId)) return;
-          this.seen.add(payload.sosId);
-          if (this.seen.size > DEDUP_CACHE_SIZE) this.seen.delete(this.seen.values().next().value!);
-          this.emit('onSOSReceived', payload);
-        } catch { /* Ignore malformed, expired or incompatible packets. */ }
-      }),
+      Peripheral.onSOSReceived(() => this.emit('onInboxReady', undefined)),
       Peripheral.onError(event => this.emit('onError', new Error(event.error))),
     ].filter((subscription): subscription is NonNullable<typeof subscription> => subscription !== null);
     this.initialized = true;
@@ -68,10 +51,20 @@ export class BLEMeshService {
     }, remaining);
   }
   public async stopAdvertising(sosId?: string): Promise<void> {
-    if (sosId && sosId !== this.advertisingId) return;
+    if (sosId) { await Peripheral.removeAdvertisement(sosId); return; }
     if (this.advertisingExpiry) clearTimeout(this.advertisingExpiry);
     if (this.initialized) await Peripheral.stopAdvertising();
     this.advertisingId = null;
+  }
+  public reportReceived(payload: SOSPayload) { this.emit('onSOSReceived', payload); }
+  public async requestPermissions(): Promise<void> {
+    if (Platform.OS === 'android') {
+      const permissions = Number(Platform.Version) >= 31 ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT, PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+      const result = await PermissionsAndroid.requestMultiple(permissions);
+      if (permissions.some(permission => result[permission] !== PermissionsAndroid.RESULTS.GRANTED)) throw new Error('Nearby relay requires Bluetooth and location permissions.');
+    }
   }
   public async startScanning(): Promise<void> {
     if (this.scanning) return;

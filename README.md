@@ -1,55 +1,24 @@
-# Suraksha mobile
+# Suraksha SOS mobile
 
-Expo SDK 57 / React Native SOS client for the companion [backend](https://github.com/rishirethish2007-source/suraksha-backend).
+Modular Expo / React Native integration with the common FastAPI backend. The UI calls `SOSTriggerService`; `src/interfaces/sos.types.ts` defines the strict TypeScript payload and `sos-api.service.ts` maps it to the backend snake_case contract.
 
-## Setup
+The workflow requests high-accuracy foreground GPS, signs the immutable origin, saves to a durable local queue, and tries the API when reachable. It falls back to BLE when disconnected or the backend is unavailable. A recent cached location can be used after GPS timeout, with provider and accuracy reported explicitly; high accuracy is requested, never guaranteed by hardware.
 
-Use Node.js 22.13+ (Node 24 recommended).
+`mesh-runtime.service.ts` owns verified receive, local notification, distance, relay hop/TTL limits, durable forwarding and retries independently of screen mounting. `origin-security.ts` implements P-256 verification; tokens and private keys stay in SecureStore and never enter mesh packets. The home screen provides nearby coordinates, map navigation and an authenticated “I can help” action (requires connectivity).
 
-```sh
-npm ci
-cp .env.example .env
-# Set EXPO_PUBLIC_API_URL to the reachable backend origin, without /api/v1.
-npm start
-```
+The local Expo module in `modules/ble-peripheral` supplies central and peripheral roles on Android/iOS. The advertising packet contains a service UUID; peers connect and fetch framed GATT data, then perform application-level store-and-forward. This is not the Bluetooth SIG Mesh profile. react-native-ble-plx alone cannot advertise as a peripheral. Frames are at most 20 bytes, with version/sequence/count headers and an overall 16 KiB limit; interrupted transfers are discarded. Native durable inboxes, queue bounds, expiry and rotating advertisements support multiple concurrent alerts.
 
-The home screen asks for your user ID, name, phone, and session token instead of sending hardcoded test identities and coordinates. The session token is held in memory; it is not persisted or broadcast over BLE. User sign-in must be connected to your identity provider before production use. `userId` must equal the JWT's `sub`. See the backend README for issuer, audience, and roles/scopes. Do not place credentials in `EXPO_PUBLIC_*` variables: those are bundled into the app.
+## Background behavior and permissions
 
-Location permission is required. The app obtains real coordinates through Expo Location and can use a recent cached fix if current GPS times out. It never silently substitutes Mumbai or (0, 0).
+- Android: explicit relay opt-in requests Bluetooth Scan/Connect/Advertise and foreground precise location permissions. A connectedDevice foreground service shows a persistent notification, owns scanning and restores queued advertising; Headless JS processes received packets and retries. Notification permission is requested separately. OEM battery restrictions, Bluetooth off, reboot and user force-stop can interrupt delivery; reopen and enable relay after force-stop/reboot. The system may restart a killed service, but this is not guaranteed.
+- iOS: CoreBluetooth central/peripheral background modes and restoration identifiers are configured. Discovery is coalesced/throttled, background advertising omits the local name and moves service UUIDs to Apple's overflow area. Android may not discover an iPhone advertising in the background. State restoration is best effort; user force-quit prevents automatic relaunch. iOS does not provide Android Headless JS; processing depends on the app receiving execution time. Do not promise continuous scanning or immediate background delivery.
+- Background retry tasks are opportunistic (minimum interval request 15 minutes), not emergency latency timers. Foreground retries run every 30 seconds. BLE notifications only happen after complete packet transfer and origin verification.
+- Enable relay before backgrounding. Expo Go, browsers and simulators cannot validate phone-to-phone BLE. Use physical devices with a native development/preview build. Production acceptance requires locked-screen, battery and radio tests on supported device models.
 
-## Delivery states
+## Authentication
 
-- **Received by server** means the API explicitly returned success.
-- **Bluetooth advertising** means the native advertising callback succeeded; it does not confirm that another device or the backend received the alert.
-- **Saved on this device** means a durable retry entry exists, with no confirmed delivery.
+Configure the common platform's OIDC issuer/client and register `suraksha://auth-callback` as its redirect URI. Sign-in uses authorization code with PKCE; refresh tokens and device keys use secure platform storage. Configure backend JWT issuer/audience/public key and the CA key. Enroll every device online before offline use; renew the default 30-day certificate by signing in again while online. You can pin the CA public key with EXPO_PUBLIC_DEVICE_CA_PUBLIC_KEY; otherwise it is trusted from the configured HTTPS enrollment endpoint. Do not enable test login or insecure HTTP in released builds.
 
-Pending alerts retry on reconnect and periodically while the screen is mounted. Expired alerts are not resent. Queued cancellations take priority over alerts and retry until confirmed. The app cannot promise retries while terminated; no background worker/foreground Android service has been implemented.
+No delivery acknowledgement propagates across the offline mesh. Other phones may continue rebroadcasting until TTL after a successful upload or cancellation. Backend deduplication and cancellation tombstones prevent resurrection; offline neighbors can still display an unexpired stale alert. Relay routing metadata is untrusted telemetry. Nearby SOS names/locations are intentionally visible to other participating phones; do not put access tokens, medical records or other unnecessary private data in the message.
 
-The **Enable nearby relay** control starts foreground scanning. An online relay gateway needs a token with the backend's `sos:relay` scope. BLE-origin identities remain unverified and nearby alerts are labelled accordingly. Never assume an unsigned received BLE packet is authenticated.
-
-## Native BLE builds
-
-Expo Go and web do not contain the local native module. They can use online delivery and durable queues, but cannot advertise or scan. Build the app to enable Bluetooth:
-
-```sh
-npm run android
-npm run ios
-```
-
-Use EAS builds if local Android/Xcode tooling is unavailable. The local module in `modules/ble-peripheral` includes Android Gradle/manifest and iOS podspec metadata for Expo autolinking. SDK defaults choose Kotlin/compile tooling; no outdated Kotlin override is applied.
-
-The versioned BLE packet uses a compact JSON array and is limited to the standard 512-byte GATT value. It includes core identity, position, timestamp, TTL, hop count, and compact relay history; optional detailed location metadata/media references are not transported. Oversized alerts remain queued for online delivery instead of being silently truncated. Both platforms use the same service UUIDs. This packet format is incompatible with the old simulated JavaScript bridge.
-
-Local cancellation stops advertising and is sent through the authenticated API. Unsigned BLE cancellation messages are deliberately not honored, since they could suppress someone else's SOS. A received relay may continue displaying until its TTL; the backend tombstone prevents cancelled alerts from being re-created after confirmed cancellation.
-
-## Checks
-
-```sh
-npm run typecheck
-npm run lint
-npm test
-npx expo install --check
-npx expo export --platform web
-```
-
-Tests exercise actual TypeScript services with mocked device/network/storage boundaries: API field mapping, server errors, nearby queries, BLE encoding/validation, concurrent queue writes, retries, cancellation persistence, and expiry. Web export and native autolinking checks do not replace an Android/iOS native build or physical two-phone BLE tests. Test denied permissions, disabled Bluetooth, disconnections, multi-hop delivery, cancellation, GPS failure, app termination, and reconnect behavior before relying on the app in an emergency.
+See [TESTING.md](TESTING.md) for setup and acceptance tests, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for boundaries, and [examples/active-relayed-sos.json](examples/active-relayed-sos.json) for the backend response fixture.

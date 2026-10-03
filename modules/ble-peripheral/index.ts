@@ -41,6 +41,9 @@ declare class BlePeripheralNativeModule extends NativeModule<BleEvents> {
   stopScanning(): Promise<boolean>;
   broadcastCancellation(cancelPayloadBase64: string): Promise<boolean>;
   isSupported(): boolean;
+  removeAdvertisement(id: string): Promise<void>;
+  getInbox(): Promise<string[]>;
+  acknowledgeInbox(packet: string): Promise<void>;
 }
 
 // ── Load Native Module ──────────────────────────────────────────
@@ -157,3 +160,9 @@ export function onError(callback: (event: BleErrorEvent) => void): EventSubscrip
   if (!emitter) return null;
   return emitter.addListener('onError', callback);
 }
+
+
+export async function getInbox(): Promise<string[]> { return nativeModule ? nativeModule.getInbox() : []; }
+export async function acknowledgeInbox(packet: string): Promise<void> { await nativeModule?.acknowledgeInbox(packet); }
+
+export async function removeAdvertisement(id: string): Promise<void> { await nativeModule?.removeAdvertisement(id); }

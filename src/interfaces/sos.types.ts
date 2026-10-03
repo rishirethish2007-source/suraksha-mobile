@@ -83,7 +83,14 @@ export interface RelayNode {
 /**
  * Core SOS Payload. This is the canonical structure transmitted over API and BLE mesh.
  */
+export interface OriginProof {
+  certificate: string; // Backend CA-signed ES256 device certificate; safe to relay.
+  signedPayload: string; // Exact immutable UTF-8 JSON bytes, never reserialize before verification.
+  signature: string; // P-256/SHA-256 IEEE-P1363 signature, 64-byte lowercase hex.
+}
+
 export interface SOSPayload {
+  originProof?: OriginProof;
   /** UUIDv4 generated client-side to ensure idempotency and prevent duplicates */
   sosId: string;
   /** Type of the message (Alert, Cancel, Ack) */

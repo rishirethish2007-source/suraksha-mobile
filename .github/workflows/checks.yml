@@ -17,6 +17,26 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: '1'
       - run: npm test
-      - run: npx expo export --platform web
+      - run: npx expo export --platform all
         env:
           EXPO_NO_TELEMETRY: '1'
+
+  android-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      EXPO_NO_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: npm ci
+      - run: npx expo prebuild --platform android --no-install
+      - run: ./gradlew :app:assembleDebug --no-daemon
+        working-directory: android

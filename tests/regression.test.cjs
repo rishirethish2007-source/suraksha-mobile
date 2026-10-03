@@ -7,6 +7,7 @@ const ts = require('typescript');
 
 // Run the real TypeScript services with only device/network boundaries mocked.
 function loader(mocks = {}, globals = {}) {
+  mocks = { './session.service': { sessionToken: async () => undefined }, ...mocks };
   const cache = new Map();
   function load(file) {
     file = path.resolve(__dirname, '..', file);
@@ -21,7 +22,7 @@ function loader(mocks = {}, globals = {}) {
       return require(name);
     };
     vm.runInNewContext(code, { module, exports: module.exports, require: localRequire,
-      console, setTimeout, clearTimeout, Date, Headers, FormData, AbortController,
+      console, setTimeout, clearTimeout, Date, Headers, FormData, AbortController, Uint8Array,
       process: { env: { EXPO_PUBLIC_API_URL: 'https://example.test' } }, ...globals }, { filename: file });
     return module.exports;
   }
@@ -77,7 +78,7 @@ test('BLE round-trip excludes bearer tokens and rejects expired/oversized packet
   assert.ok(!Buffer.from(encoded, 'base64').toString().includes('never-broadcast-this'));
   assert.equal(decodePayload(encoded).sosId, 'sos-1');
   assert.throws(() => encodePayload({ ...payload(), timestamp: '2000-01-01T00:00:00Z' }), /expired/);
-  assert.throws(() => encodePayload({ ...payload(), message: 'x'.repeat(1000) }), /too large/);
+  assert.throws(() => encodePayload({ ...payload(), message: 'x'.repeat(20000) }), /16 KiB/);
   assert.throws(() => decodePayload(Buffer.from('{}').toString('base64')), /Invalid/);
 });
 
@@ -88,6 +89,7 @@ function queueHarness() {
   const storage = { async getItem(key) { await Promise.resolve(); return store.get(key) ?? null; },
     async setItem(key,value) { await Promise.resolve(); store.set(key,value); } };
   class BLEMeshService {
+    async requestPermissions() {}
     async startAdvertising() { if (!advertise) throw Error('No BLE'); }
     async stopAdvertising() {}
   }
@@ -98,6 +100,8 @@ function queueHarness() {
     '@react-native-async-storage/async-storage': storage,
     './location.service': { LocationService: { async getCurrentLocation() { return payload().location; } } },
     './network.service': { NetworkService: { async checkConnectivity() { return { isOnline: online }; } } },
+    './origin-security': { signOrigin: async () => ({ certificate: 'test', signedPayload: '{}', signature: 'test' }) },
+    'expo-crypto': { randomUUID: require('node:crypto').randomUUID },
     './sos-api.service': { SOSApiService: api, ApiError }, './ble-mesh.service': { BLEMeshService },
   });
   return { service: load('src/services/sos-trigger.service.ts').SOSTriggerService, store, sent,
@@ -137,4 +141,48 @@ test('expired alerts are discarded without being uploaded', async () => {
   h.store.set('@suraksha_sos_queue', JSON.stringify([{ ...payload(), timestamp:'2000-01-01T00:00:00Z' }]));
   h.setOnline(true); await h.service.retryPendingQueue();
   assert.equal(h.sent.length, 0); assert.equal(h.store.get('@suraksha_sos_queue'), '[]');
+});
+
+
+test('real P-256 certificates verify; forged payload, signature and authority fail', async () => {
+  const { p256 } = require('@noble/curves/nist.js');
+  const { randomBytes } = require('node:crypto');
+  const ca = randomBytes(32), device = randomBytes(32);
+  const pub = key => Buffer.from(p256.getPublicKey(key, false)).toString('hex');
+  const b64 = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const header = b64({alg:'ES256',typ:'JWT'});
+  const claims = b64({sub:'owner',device_id:'device',public_key:pub(device),iss:'suraksha-device-ca',aud:'suraksha-ble',exp:Math.floor(Date.now()/1000)+3600});
+  const certificate = `${header}.${claims}.${Buffer.from(p256.sign(Buffer.from(`${header}.${claims}`),ca)).toString('base64url')}`;
+  const security = loader({ 'expo-secure-store': {getItemAsync:async()=>pub(ca)},
+    'expo-crypto': {}, 'react-native': {Platform:{OS:'android'}} })('src/services/origin-security.ts');
+  const event = payload();
+  const signedPayload = JSON.stringify(security.immutableOrigin(event));
+  event.originProof = { certificate, signedPayload, signature:Buffer.from(p256.sign(Buffer.from(signedPayload),device)).toString('hex') };
+  await security.verifyOrigin(event);
+  await assert.rejects(security.verifyOrigin({...event, location:{...event.location, latitude:13}}), /mismatch/);
+  await assert.rejects(security.verifyOrigin({...event, originProof:{...event.originProof, signature:'00'.repeat(64)}}), /mismatch/);
+  await assert.rejects(security.verifyOrigin({...event, userId:'attacker'}), /Untrusted/);
+});
+
+test('relay inbox is acknowledged only after persistence and failed uploads remain queued', async () => {
+  const store = new Map(); let inbox = ['packet']; let fail = true; let notifications = 0; let advertised = 0;
+  const event = payload('relay-test');
+  const load = loader({
+    '@react-native-async-storage/async-storage': {getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-notifications':{scheduleNotificationAsync:async()=>{notifications++;}},
+    'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},
+    'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>inbox,acknowledgeInbox:async()=>{assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);inbox=[];}},
+    './ble-codec':{decodePayload:()=>event,isLivePayload:()=>true},
+    './origin-security':{verifyOrigin:async()=>{}},
+    './session.service':{loadSession:async()=>({user:{user_id:'relay'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{if(fail)throw Error('network unavailable');}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{advertised++;},stopAdvertising:async()=>{}}},
+  });
+  const runtime=load('src/services/mesh-runtime.service.ts');
+  await runtime.processMeshWork();
+  assert.equal(notifications,1);assert.equal(advertised,1);assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);
+  fail=false;await runtime.processMeshWork();
+  assert.equal(store.get('@suraksha.relay.pending.v2'),'[]');assert.equal(notifications,1);
 });

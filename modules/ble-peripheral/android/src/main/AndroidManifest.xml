@@ -1,1 +1,10 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <application>
+    <service android:name="com.suraksha.bleperipheral.MeshForegroundService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+    <service android:name="com.suraksha.bleperipheral.MeshRelayTaskService" android:exported="false" />
+  </application>
+</manifest>

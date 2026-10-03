@@ -1,9 +1,12 @@
 import { SOSPayload, SOSCancellation, SOSResponse, ActiveSOSEvent, SOSLocation, RelayNode } from '../interfaces/sos.types';
+import { sessionToken } from './session.service';
 import { apiUrl } from '../constants/api';
 
 type WireResponse = { success: boolean; sos_id: string; message: string; is_duplicate: boolean; server_timestamp: string };
 const wireLocation = (location: SOSLocation) => ({ ...location, lat: location.latitude, lng: location.longitude });
 export const toWirePayload = (payload: SOSPayload) => ({
+  origin_proof: payload.originProof ? { certificate: payload.originProof.certificate,
+    signed_payload: payload.originProof.signedPayload, signature: payload.originProof.signature } : undefined,
   sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
   user_phone: payload.userPhone, sos_type: payload.sosType, message_type: payload.messageType,
   location: wireLocation(payload.location), delivery_method: payload.deliveryMethod,
@@ -31,7 +34,8 @@ export class SOSApiService {
       try {
         const headers = new Headers(options.headers);
         if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-        if (token || this.token) headers.set('Authorization', `Bearer ${token || this.token}`);
+        const accessToken = token || this.token || await sessionToken();
+        if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
         const response = await fetch(url, { ...options, headers, signal: controller.signal });
         const text = await response.text();
         let data;
@@ -85,6 +89,11 @@ export class SOSApiService {
       mediaAttachmentIds: event.media_attachment_ids ?? [], distanceMeters: event.distance_meters,
       acknowledgedBy: event.acknowledged_by ?? [], respondersEnRoute: event.responders_en_route,
     }));
+  }
+
+  public static async respond(sosId: string, userId: string): Promise<SOSResponse> {
+    const body = new FormData(); body.append('user_id', userId);
+    return this.result(await this.request<WireResponse>(`/sos/${encodeURIComponent(sosId)}/respond`, { method: 'POST', body }));
   }
 
   public static async uploadMedia(sosId: string, fileUri: string, authToken: string, uploadedBy: string): Promise<{ success: boolean; mediaId: string }> {
