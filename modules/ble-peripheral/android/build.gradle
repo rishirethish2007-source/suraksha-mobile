@@ -9,3 +9,8 @@ android {
   namespace "com.suraksha.bleperipheral"
   defaultConfig { versionCode 1; versionName "1.0.0" }
 }
+
+// Headless JS classes are not exported through expo-modules-core.
+dependencies {
+  implementation "com.facebook.react:react-android"
+}

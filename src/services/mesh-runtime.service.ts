@@ -41,7 +41,7 @@ async function notify(event: ActiveSOSEvent) {
   const distance = event.distanceMeters === undefined ? 'Distance unavailable' : `${Math.round(event.distanceMeters)} m away`;
   await Notifications.scheduleNotificationAsync({ content: { title: `Nearby ${event.sosType} SOS`,
     body: `${event.userName}: ${distance}. Open Suraksha to view location and offer help.`,
-    sound: 'default', data: { sosId: event.sosId }, categoryIdentifier: 'SOS_HELP' }, trigger: null });
+    sound: 'default', data: { sosId: event.sosId }, categoryIdentifier: 'SOS_HELP' }, trigger: Platform.OS === 'android' ? { channelId: 'sos-alerts' } : null });
 }
 export function processMeshWork(): Promise<void> {
   return serial(async () => {
