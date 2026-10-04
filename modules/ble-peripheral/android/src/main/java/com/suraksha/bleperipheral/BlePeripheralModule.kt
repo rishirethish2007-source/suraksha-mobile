@@ -33,6 +33,8 @@ class BlePeripheralModule : Module() {
         Name("BlePeripheral")
         Events("onSOSReceived", "onCancelReceived", "onDeviceDiscovered", "onError")
         OnCreate { MeshRuntime.listener = { name, body -> sendEvent(name, body) } }
+        OnActivityEntersForeground { MeshRuntime.engine?.setForeground(true) }
+        OnActivityEntersBackground { MeshRuntime.engine?.setForeground(false) }
         OnDestroy { MeshRuntime.listener = null } // The service deliberately survives React teardown.
         AsyncFunction("initialize") { MeshRuntime.get(requireContext()).checkBluetooth(); true }
         AsyncFunction("startAdvertising") { payload: String, promise: Promise ->
@@ -45,7 +47,7 @@ class BlePeripheralModule : Module() {
             MeshRuntime.get(context).checkBluetooth()
             val intent = Intent(context, MeshForegroundService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
-            MeshRuntime.get(context).startScanning()
+            MeshRuntime.get(context).also { it.setForeground(appContext.currentActivity != null); it.startScanning() }
             true
         }
         AsyncFunction("stopScanning") {
@@ -114,11 +116,14 @@ internal class MeshEngine(private val context: Context) {
     companion object {
         val SERVICE: UUID = UUID.fromString("8fc9a2e0-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
         val DATA: UUID = UUID.fromString("8fc9a2e1-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
+        val FAST_DATA: UUID = UUID.fromString("8fc9a2e3-1b2a-4c3d-9e5f-0a1b2c3d4e5f")
         const val MAX_BYTES = 16384
     }
     private val adapter get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: throw IllegalStateException("Bluetooth unsupported")
     private val handler = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE)
+    private var foreground = false
+    private var scanWanted = false
     private var scanning = false
     private var advertising = false
     private var server: BluetoothGattServer? = null
@@ -163,6 +168,8 @@ internal class MeshEngine(private val context: Context) {
     private val connections = ConcurrentHashMap<String, BluetoothGatt>()
     private val cursors = ConcurrentHashMap<String, Int>()
     private val snapshots = ConcurrentHashMap<String, ByteArray>()
+    private val mtus = ConcurrentHashMap<String, Int>()
+    private val chunkSizes = ConcurrentHashMap<String, Int>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
     private var advertExpiry: Runnable? = null
     private val advertTimeout = Runnable { failAdvertising("Advertising timed out") }
@@ -183,14 +190,25 @@ internal class MeshEngine(private val context: Context) {
         MeshRuntime.listener?.invoke("onSOSReceived", mapOf("payloadBase64" to packet, "deviceId" to "native"))
         try { context.startService(Intent(context, MeshRelayTaskService::class.java)) } catch (_: Exception) {}
     }
+    fun setForeground(value: Boolean) {
+        if (foreground == value) return
+        foreground = value
+        if (scanning) {
+            // Change duty cycle without dropping active GATT transfers.
+            try { adapter.bluetoothLeScanner.stopScan(scanCallback); scanning = false; startScanning() }
+            catch (error: Exception) { MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Cannot restart scan"))) }
+        }
+    }
     fun startScanning() {
+        scanWanted = true
         checkBluetooth()
         if (scanning) return
         adapter.bluetoothLeScanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
-            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scanCallback)
+            ScanSettings.Builder().setScanMode(if (foreground) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED).build(), scanCallback)
         scanning = true
     }
     fun stopScanning() {
+        scanWanted = false
         try { adapter?.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: SecurityException) {}
         scanning = false
         connections.values.forEach { try { it.disconnect(); it.close() } catch (_: Exception) {} }
@@ -221,6 +239,8 @@ internal class MeshEngine(private val context: Context) {
         check(server != null) { "GATT server unavailable" }
         val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         service.addCharacteristic(BluetoothGattCharacteristic(DATA, BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ))
+        // Separate characteristic preserves interoperability with old 20-byte readers.
+        service.addCharacteristic(BluetoothGattCharacteristic(FAST_DATA, BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ))
         check(server!!.addService(service)) { "Cannot publish GATT service" }
         handler.postDelayed(advertTimeout, 10000)
     }
@@ -232,7 +252,7 @@ internal class MeshEngine(private val context: Context) {
         pending?.reject("BLE_STOPPED", "Advertising stopped", null); pending = null
         try { adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertCallback) } catch (_: Exception) {}
         server?.close(); server = null; advertising = false
-        cursors.clear(); snapshots.clear()
+        cursors.clear(); snapshots.clear(); mtus.clear(); chunkSizes.clear()
     }
     private fun failAdvertising(message: String) {
         pending?.reject("BLE_ADV_ERROR", message, null); pending = null
@@ -243,23 +263,27 @@ internal class MeshEngine(private val context: Context) {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             if (!starting) return
             if (status != BluetoothGatt.GATT_SUCCESS) { failAdvertising("Cannot publish GATT service"); return }
-            val settings = AdvertiseSettings.Builder().setConnectable(true).setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER).build()
+            val settings = AdvertiseSettings.Builder().setConnectable(true).setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY).build()
             val data = AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).setIncludeDeviceName(false).build()
             adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, advertCallback) ?: failAdvertising("Peripheral mode unsupported")
         }
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, state: Int) {
-            cursors.remove(device.address); snapshots.remove(device.address)
+            cursors.remove(device.address); snapshots.remove(device.address); mtus.remove(device.address); chunkSizes.remove(device.address)
         }
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) { mtus[device.address] = mtu }
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
-            if (offset != 0 || characteristic.uuid != DATA) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_INVALID_OFFSET,offset,null); return }
+            if (offset != 0 || (characteristic.uuid != DATA && characteristic.uuid != FAST_DATA)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_INVALID_OFFSET,offset,null); return }
             if (snapshots.size >= 8 && !snapshots.containsKey(device.address)) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
             val snapshot = snapshots.getOrPut(device.address) { payload.copyOf() }
             val seq = cursors[device.address] ?: 0
-            val total = (snapshot.size + 11) / 12
+            val chunkSize = chunkSizes.getOrPut(device.address) {
+                if (characteristic.uuid == FAST_DATA) minOf(180, maxOf(12, (mtus[device.address] ?: 23) - 11)) else 12
+            }
+            val total = (snapshot.size + chunkSize - 1) / chunkSize
             if (total == 0 || seq >= total) { server?.sendResponse(device,requestId,BluetoothGatt.GATT_FAILURE,0,null); return }
-            val chunk = snapshot.copyOfRange(seq * 12, minOf(snapshot.size, (seq+1)*12))
-            // SK, version 2, seq uint16, total uint16, byte count, then <=12 bytes.
-            // A <=20-byte frame works at the minimum ATT MTU and never requires long reads.
+            val chunk = snapshot.copyOfRange(seq * chunkSize, minOf(snapshot.size, (seq+1)*chunkSize))
+            // Legacy DATA remains 20 bytes. FAST_DATA fits the negotiated ATT MTU.
+            // Freeze chunk size per connection so sequence offsets stay consistent.
             val frame = byteArrayOf(83,75,2,(seq shr 8).toByte(),seq.toByte(),(total shr 8).toByte(),total.toByte(),chunk.size.toByte()) + chunk
             server?.sendResponse(device,requestId,BluetoothGatt.GATT_SUCCESS,0,frame)
             cursors[device.address] = seq + 1
@@ -270,11 +294,17 @@ internal class MeshEngine(private val context: Context) {
         override fun onStartFailure(code: Int) { failAdvertising("Advertising failed: $code") }
     }
     private val scanCallback = object : ScanCallback() {
-        override fun onScanFailed(code: Int) { scanning=false; MeshRuntime.listener?.invoke("onError", mapOf("error" to "Scanning failed: $code")) }
+        override fun onScanFailed(code: Int) {
+            scanning = false
+            MeshRuntime.listener?.invoke("onError", mapOf("error" to "Scanning interrupted ($code); retrying shortly"))
+            handler.postDelayed({
+                if (scanWanted && !scanning) try { startScanning() } catch (_: Exception) {}
+            }, 6000)
+        }
         override fun onScanResult(type: Int, result: ScanResult) {
             val device = result.device
             val now = System.currentTimeMillis()
-            if (connections.size >= 4 || connections.containsKey(device.address) || now - (lastSeen[device.address] ?: 0) < 65000) return
+            if (connections.size >= 4 || connections.containsKey(device.address) || now - (lastSeen[device.address] ?: 0) < 3000) return
             if (lastSeen.size > 1000) lastSeen.clear()
             lastSeen[device.address] = now
             connect(device)
@@ -284,14 +314,32 @@ internal class MeshEngine(private val context: Context) {
         val bytes = ByteArrayOutputStream()
         var expected = 0
         var count = -1
+        var lastProgress = System.currentTimeMillis()
+        var discoveryStarted = false
+        var finished = false
         val gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
-            fun finish(gatt: BluetoothGatt) { connections.remove(device.address); gatt.disconnect(); gatt.close() }
+            @Synchronized fun finish(gatt: BluetoothGatt) {
+                if (finished) return
+                finished = true
+                lastSeen[device.address] = System.currentTimeMillis()
+                connections.remove(device.address, gatt); gatt.disconnect(); gatt.close()
+            }
+            @Synchronized fun discover(gatt: BluetoothGatt) {
+                if (finished || discoveryStarted) return
+                discoveryStarted = true
+                if (!gatt.discoverServices()) finish(gatt)
+            }
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) { discover(gatt) }
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, state: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) finish(gatt)
-                else if (state == BluetoothProfile.STATE_CONNECTED && !gatt.discoverServices()) finish(gatt)
+                else if (state == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    if (!gatt.requestMtu(247)) discover(gatt)
+                    else handler.postDelayed({ discover(gatt) }, 1500)
+                }
             }
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                val char = gatt.getService(SERVICE)?.getCharacteristic(DATA)
+                val char = gatt.getService(SERVICE)?.let { it.getCharacteristic(FAST_DATA) ?: it.getCharacteristic(DATA) }
                 if (status != BluetoothGatt.GATT_SUCCESS || char == null || !gatt.readCharacteristic(char)) finish(gatt)
             }
             @Deprecated("Compatibility callback for Android < 33")
@@ -306,7 +354,8 @@ internal class MeshEngine(private val context: Context) {
                 val seq = ((frame[3].toInt() and 255) shl 8) or (frame[4].toInt() and 255)
                 val total = ((frame[5].toInt() and 255) shl 8) or (frame[6].toInt() and 255)
                 val size = frame[7].toInt() and 255
-                if (seq != expected || total < 1 || total > 1366 || (count != -1 && count != total) || size !in 1..12 || frame.size != 8+size || bytes.size()+size > MAX_BYTES) { finish(gatt); return }
+                if (seq != expected || total < 1 || total > 1366 || (count != -1 && count != total) || size !in 1..(if (char.uuid == FAST_DATA) 180 else 12) || frame.size != 8+size || bytes.size()+size > MAX_BYTES) { finish(gatt); return }
+                lastProgress = System.currentTimeMillis()
                 count = total; expected++
                 bytes.write(frame,8,size)
                 if (expected == total) { received(bytes.toByteArray()); finish(gatt) }
@@ -315,7 +364,18 @@ internal class MeshEngine(private val context: Context) {
         }, BluetoothDevice.TRANSPORT_LE)
         if (gatt != null) {
             connections[device.address]=gatt
-            handler.postDelayed({ if(connections.remove(device.address,gatt)) { gatt.disconnect(); gatt.close() } },60000)
+            val idleTimeout = object : Runnable {
+                override fun run() {
+                    if (connections[device.address] !== gatt) return
+                    if (System.currentTimeMillis() - lastProgress < 15000) { handler.postDelayed(this, 5000); return }
+                    if (connections.remove(device.address, gatt)) {
+                        finished = true
+                        lastSeen[device.address] = System.currentTimeMillis()
+                        gatt.disconnect(); gatt.close()
+                    }
+                }
+            }
+            handler.postDelayed(idleTimeout, 15000)
         }
     }
 }

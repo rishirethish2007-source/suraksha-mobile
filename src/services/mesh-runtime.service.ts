@@ -16,6 +16,9 @@ import { ActiveSOSEvent, SOSPayload, SOSLocation } from '../interfaces/sos.types
 export const RETRY_TASK = 'suraksha-sos-retry-v2';
 const RELAYS = '@suraksha.relay.pending.v2';
 const NEARBY = '@suraksha.nearby.v2';
+const FORWARDED = '@suraksha.relay.forwarded.v1';
+const DISMISSED = '@suraksha.nearby.dismissed.v1';
+let forwarding: Promise<void> | undefined;
 const ENABLED = '@suraksha.relay.enabled.v2';
 let operations: Promise<unknown> = Promise.resolve();
 let unsubscribe: (() => void) | undefined;
@@ -28,7 +31,18 @@ async function list<T>(key: string): Promise<T[]> {
   return value ? JSON.parse(value) : [];
 }
 export async function nearbyEvents(): Promise<ActiveSOSEvent[]> {
-  return (await list<ActiveSOSEvent>(NEARBY)).filter(isLivePayload);
+  const hidden = await list<{ id: string; until: number }>(DISMISSED);
+  return (await list<ActiveSOSEvent>(NEARBY)).filter(event => isLivePayload(event) && !hidden.some(item => item.id === event.sosId && item.until > Date.now()));
+}
+export async function dismissNearbySOS(id: string): Promise<void> {
+  await serial(async () => {
+    const event = (await list<ActiveSOSEvent>(NEARBY)).find(item => item.sosId === id);
+    if (!event) return;
+    const hidden = (await list<{ id: string; until: number }>(DISMISSED)).filter(item => item.until > Date.now() && item.id !== id);
+    hidden.push({ id, until: Date.parse(event.timestamp) + event.ttlSeconds * 1000 });
+    await AsyncStorage.setItem(DISMISSED, JSON.stringify(hidden));
+  });
+  await Notifications.dismissNotificationAsync(`sos-${id}`).catch(() => undefined);
 }
 async function location(): Promise<SOSLocation | undefined> {
   try {
@@ -39,18 +53,19 @@ async function location(): Promise<SOSLocation | undefined> {
 async function notify(event: ActiveSOSEvent) {
   if (Platform.OS === 'web') return;
   const distance = event.distanceMeters === undefined ? 'Distance unavailable' : `${Math.round(event.distanceMeters)} m away`;
-  await Notifications.scheduleNotificationAsync({ content: { title: `Nearby ${event.sosType} SOS`,
+  await Notifications.scheduleNotificationAsync({ identifier: `sos-${event.sosId}`, content: { title: `Nearby ${event.sosType} SOS`,
     body: `${event.userName}: ${distance}. Open Suraksha to view location and offer help.`,
     sound: 'default', data: { sosId: event.sosId }, categoryIdentifier: 'SOS_HELP' }, trigger: Platform.OS === 'android' ? { channelId: 'sos-alerts' } : null });
 }
-export function processMeshWork(): Promise<void> {
+async function receiveMeshInbox(): Promise<void> {
   return serial(async () => {
     const session = await loadSession();
     if (!session) return;
     const deviceId = await SOSTriggerService.getDeviceId();
     const selfLocation = await location();
-    let events = await nearbyEvents();
-    let pending = (await list<SOSPayload>(RELAYS)).filter(isLivePayload);
+    let events = (await list<ActiveSOSEvent>(NEARBY)).filter(isLivePayload);
+    const pending = (await list<SOSPayload>(RELAYS)).filter(isLivePayload);
+    const forwarded = (await list<{ id: string; until: number }>(FORWARDED)).filter(item => item.until > Date.now());
     for (const packet of await Peripheral.getInbox()) {
       let payload: SOSPayload;
       try { payload = decodePayload(packet); await verifyOrigin(payload); }
@@ -58,7 +73,8 @@ export function processMeshWork(): Promise<void> {
       if (payload.originDeviceId === deviceId || payload.relayChain.some(node => node.deviceId === deviceId)) {
         await Peripheral.acknowledgeInbox(packet); continue;
       }
-      if (!events.some(event => event.sosId === payload.sosId)) {
+      const firstReceipt = !events.some(event => event.sosId === payload.sosId);
+      if (firstReceipt) {
         const distanceMeters = selfLocation ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
           payload.location.latitude, payload.location.longitude) : undefined;
         const event = { ...payload, distanceMeters };
@@ -67,36 +83,52 @@ export function processMeshWork(): Promise<void> {
         bleMeshInstance.reportReceived(event);
         await notify(event).catch(() => undefined); // Denied notifications must not block emergency forwarding.
       }
-      if (payload.hopCount < payload.maxHops && !pending.some(item => item.sosId === payload.sosId)) {
+      if (!forwarded.some(item => item.id === payload.sosId) && payload.hopCount < payload.maxHops && !pending.some(item => item.sosId === payload.sosId)) {
         pending.push(bleMeshInstance.prepareRelay(payload, deviceId, selfLocation));
         await AsyncStorage.setItem(RELAYS, JSON.stringify(pending));
       }
       // Acknowledge only after the forwarding queue is durable.
       await Peripheral.acknowledgeInbox(packet);
     }
-    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
-    const remaining: SOSPayload[] = [];
-    for (const payload of pending) {
-      let delivered = false;
-      if (isOnline) {
-        try { await SOSApiService.sendSOS(payload); delivered = true; } catch (error) { if (error instanceof ApiError && error.status === 410) delivered = true; /* Cancelled events must not be rebroadcast. */ }
-      }
-      if (delivered) await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
-      if (!delivered) {
-        remaining.push(payload);
-        await bleMeshInstance.startAdvertising(payload).catch(() => undefined);
-      }
-    }
-    await AsyncStorage.setItem(RELAYS, JSON.stringify(remaining));
-    await SOSTriggerService.retryPendingQueue();
   });
+}
+// Incoming packets and notifications never wait for an API upload. Only short
+// storage updates share the inbox lock; the single upload pump reconciles IDs.
+export async function processMeshWork(): Promise<void> {
+  await receiveMeshInbox();
+  if (!forwarding) forwarding = forwardPending().finally(() => { forwarding = undefined; });
+  await forwarding;
+}
+async function forwardPending(): Promise<void> {
+  const pending = await serial(async () => (await list<SOSPayload>(RELAYS)).filter(isLivePayload));
+  const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
+  for (const payload of pending) {
+    let delivered = false;
+    let cancelled = false;
+    if (isOnline) {
+      try { await SOSApiService.sendSOS(payload); delivered = true; }
+      catch (error) { if (error instanceof ApiError && error.status === 410) { delivered = true; cancelled = true; } }
+    }
+    if (delivered) {
+      await bleMeshInstance.stopAdvertising(payload.sosId).catch(() => undefined);
+      await serial(async () => {
+        const forwarded = (await list<{ id: string; until: number }>(FORWARDED)).filter(item => item.until > Date.now() && item.id !== payload.sosId);
+        forwarded.push({ id: payload.sosId, until: Date.parse(payload.timestamp) + payload.ttlSeconds * 1000 });
+        await AsyncStorage.setItem(FORWARDED, JSON.stringify(forwarded));
+        const latest = (await list<SOSPayload>(RELAYS)).filter(item => item.sosId !== payload.sosId && isLivePayload(item));
+        await AsyncStorage.setItem(RELAYS, JSON.stringify(latest));
+        if (cancelled) await AsyncStorage.setItem(NEARBY, JSON.stringify((await list<ActiveSOSEvent>(NEARBY)).filter(item => item.sosId !== payload.sosId)));
+      });
+    } else await bleMeshInstance.startAdvertising(payload).catch(() => undefined);
+  }
+  await SOSTriggerService.retryPendingQueue();
 }
 export async function setRelayEnabled(enabled: boolean): Promise<void> {
   if (enabled) {
     if (!(await loadSession())) throw new Error('Sign in and enroll this device before enabling relay.');
     await bleMeshInstance.requestPermissions();
     const permission = await Location.requestForegroundPermissionsAsync();
-    if (permission.granted) await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }).catch(() => undefined);
+    if (permission.granted) void Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }).catch(() => undefined);
     if (Platform.OS !== 'web') {
       if (Platform.OS === 'android') await Notifications.setNotificationChannelAsync('sos-alerts', { name: 'Nearby SOS alerts', importance: Notifications.AndroidImportance.HIGH });
       await Notifications.requestPermissionsAsync();

@@ -27,7 +27,7 @@ const SOS_TYPES = Object.values(SOSType);
 const LONG_PRESS_MS = 3000;
 
 function RelayPanel({ deviceId, userId }: { deviceId: string; userId: string }) {
-  const { isScanning, nearbySOSEvents, error } = useBLEMesh(deviceId);
+  const { isScanning, nearbySOSEvents, error, dismissSOS } = useBLEMesh(deviceId);
   return <View style={{ padding: 16, gap: 12 }}>
     <Text style={{ color: '#ddd' }}>{isScanning ? 'Nearby relay enabled' : 'Nearby SOS alerts'}</Text>
     {error && <Text style={{ color: '#ff9b90' }}>{error}</Text>}
@@ -39,6 +39,7 @@ function RelayPanel({ deviceId, userId }: { deviceId: string; userId: string }) 
         try { await SOSApiService.respond(event.sosId, userId); Alert.alert('Response recorded', 'The server has recorded that you are on your way.'); }
         catch (error) { Alert.alert('Response not confirmed', error instanceof Error ? error.message : 'Reconnect and try again.'); }
       }}><Text style={{ color: '#7af', padding: 8 }}>I can help — mark me en route</Text></TouchableOpacity>
+      <TouchableOpacity accessibilityRole="button" onPress={() => { void dismissSOS(event.sosId).catch(() => Alert.alert('Unable to dismiss alert', 'Please try again.')); }}><Text style={{ color: '#ddd', padding: 8 }}>Dismiss this message</Text></TouchableOpacity>
     </View>)}
   </View>;
 }
@@ -83,6 +84,7 @@ export default function Index() {
   // ── Press handlers ────────────────────────────────────────────
   const onPressIn = () => {
     if (sending.current || showPicker) return;
+    if (lastSOS) { Alert.alert("SOS already active", "Cancel your current SOS before starting another one."); return; }
     setIsPressing(true);
     Vibration.vibrate(50);
     Animated.timing(progressAnim, { toValue: 1, duration: LONG_PRESS_MS, useNativeDriver: false }).start();
@@ -186,6 +188,9 @@ export default function Index() {
       {statusMsg !== '' && (
         <View style={[styles.statusBox, status === 'sent' ? styles.green : status === 'error' ? styles.red : styles.yellow]}>
           <Text style={styles.statusText}>{statusMsg}</Text>
+          {status !== 'sending' && <TouchableOpacity accessibilityRole="button" onPress={() => { setStatusMsg(''); setStatus('idle'); }}>
+            <Text style={{ color: '#7af', textAlign: 'center', padding: 12 }}>Dismiss message</Text>
+          </TouchableOpacity>}
         </View>
       )}
 

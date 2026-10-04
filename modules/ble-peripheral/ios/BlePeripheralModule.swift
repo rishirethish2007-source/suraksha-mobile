@@ -413,7 +413,7 @@ public class BlePeripheralModule: Module {
             ])
 
             // Bound resources and reconnect frequency; no duplicate delivery assumptions.
-            guard connectedPeripherals.count < 4, Date().timeIntervalSince(lastSeen[peripheral.identifier] ?? .distantPast) > 65 else { return }
+            guard connectedPeripherals.count < 4, Date().timeIntervalSince(lastSeen[peripheral.identifier] ?? .distantPast) > 3 else { return }
             if lastSeen.count > 1000 { lastSeen.removeAll() }
             lastSeen[peripheral.identifier] = Date()
             buffers[peripheral.identifier] = Data()
@@ -432,9 +432,11 @@ public class BlePeripheralModule: Module {
         }
 
         func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+            lastSeen[peripheral.identifier] = Date()
             connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
         }
         func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+            lastSeen[peripheral.identifier] = Date()
             connectedPeripherals.removeAll { $0.identifier == peripheral.identifier }
         }
 

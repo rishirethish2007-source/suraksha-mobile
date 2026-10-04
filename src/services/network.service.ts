@@ -15,16 +15,7 @@ export class NetworkService {
   public static async checkConnectivity(): Promise<{ isOnline: boolean; connectionType: string }> {
     const state: NetInfoState = await NetInfo.fetch();
     
-    // Some devices report true for isConnected on captive portals, so we verify with isInternetReachable
-    const isOnline = !!(state.isConnected && state.isInternetReachable);
-    
-    // In disaster zones, if state.isInternetReachable is null (still checking), 
-    // we may want to perform a direct ping test to be absolutely sure.
-    let confirmedOnline = isOnline;
-    if (state.isConnected && state.isInternetReachable === null) {
-      confirmedOnline = await this.pingServer();
-    }
-    
+    const confirmedOnline = !!state.isConnected && await this.pingServer();
     return {
       isOnline: confirmedOnline,
       connectionType: state.type
@@ -38,7 +29,7 @@ export class NetworkService {
    */
   public static subscribe(callback: (isOnline: boolean) => void): NetInfoSubscription {
     return NetInfo.addEventListener(state => {
-      const isOnline = !!(state.isConnected && state.isInternetReachable);
+      const isOnline = !!state.isConnected;
       callback(isOnline);
     });
   }
@@ -49,7 +40,7 @@ export class NetworkService {
    */
   private static async pingServer(): Promise<boolean> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
     try {
       
       const response = await fetch(apiUrl('/health'), {

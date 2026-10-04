@@ -85,7 +85,7 @@ test('BLE round-trip excludes bearer tokens and rejects expired/oversized packet
 
 function queueHarness() {
   const store = new Map();
-  let online = false; let failSend = false; let failCancel = false; let advertise = false;
+  let blockSend; let online = false; let failSend = false; let failCancel = false; let advertise = false;
   const sent = [];
   const storage = { async getItem(key) { await Promise.resolve(); return store.get(key) ?? null; },
     async setItem(key,value) { await Promise.resolve(); store.set(key,value); } };
@@ -95,7 +95,7 @@ function queueHarness() {
     async stopAdvertising() {}
   }
   class ApiError extends Error {}
-  const api = { setAuthToken() {}, async sendSOS(p) { if (failSend) throw Error('Offline'); sent.push(p); return { success: true }; },
+  const api = { setAuthToken() {}, async sendSOS(p) { if (blockSend) await blockSend(); if (failSend) throw Error('Offline'); sent.push(p); return { success: true }; },
     async cancelSOS() { if (failCancel) throw Error('Offline'); return { success: true }; } };
   const load = loader({
     '@react-native-async-storage/async-storage': storage,
@@ -106,7 +106,7 @@ function queueHarness() {
     './sos-api.service': { SOSApiService: api, ApiError }, './ble-mesh.service': { BLEMeshService },
   });
   return { service: load('src/services/sos-trigger.service.ts').SOSTriggerService, store, sent,
-    setOnline(value) { online=value; }, setFailSend(value) { failSend=value; }, setFailCancel(value) { failCancel=value; },
+    setBlockSend(value) { blockSend=value; }, setOnline(value) { online=value; }, setFailSend(value) { failSend=value; }, setFailCancel(value) { failCancel=value; },
     setAdvertise(value) { advertise=value; } };
 }
 const params = { userId:'owner', userName:'Name', userPhone:'123', sosType:'MEDICAL', authToken:'secret' };
@@ -191,4 +191,75 @@ test('relay inbox is acknowledged only after persistence and failed uploads rema
   assert.equal(notifications,1);assert.equal(advertised,1);assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);
   fail=false;await runtime.processMeshWork();
   assert.equal(store.get('@suraksha.relay.pending.v2'),'[]');assert.equal(notifications,1);
+});
+
+test('new nearby alerts and persistent dismissal are independent of a blocked upload', async () => {
+  const store = new Map(); let inbox = ['one']; const notifications = [];
+  let release; const blocked = new Promise(resolve => { release = resolve; });
+  let began; const started = new Promise(resolve => { began = resolve; });
+  let dismissed;
+  const mocks = {
+    '@react-native-async-storage/async-storage': {getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-notifications':{scheduleNotificationAsync:async n=>notifications.push(n.identifier),dismissNotificationAsync:async id=>{dismissed=id;}},
+    'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},
+    'react-native':{Platform:{OS:'android'}},
+    '../../modules/ble-peripheral':{getInbox:async()=>[...inbox],acknowledgeInbox:async packet=>{inbox=inbox.filter(x=>x!==packet);}},
+    './ble-codec':{decodePayload:id=>payload(id),isLivePayload:()=>true},
+    './origin-security':{verifyOrigin:async()=>{}},
+    './session.service':{loadSession:async()=>({user:{user_id:'relay'}})},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{sendSOS:async()=>{began(); await blocked;}}},
+    './sos-trigger.service':{SOSTriggerService:{getDeviceId:async()=> 'device-b',retryPendingQueue:async()=>{}},bleMeshInstance:{reportReceived(){},prepareRelay:p=>({...p,hopCount:1}),startAdvertising:async()=>{},stopAdvertising:async()=>{}}},
+  };
+  const runtime = loader(mocks)('src/services/mesh-runtime.service.ts');
+  const first = runtime.processMeshWork(); await started;
+  inbox=['two']; const second=runtime.processMeshWork();
+  // Dismissal shares only the short storage lock, so also waits for packet two's ingestion.
+  await runtime.dismissNearbySOS('one');
+  assert.deepEqual(notifications,['sos-one','sos-two']);
+  assert.equal(dismissed,'sos-one');
+  assert.equal((await runtime.nearbyEvents()).map(x=>x.sosId).join(','),'two');
+  const restarted = loader(mocks)('src/services/mesh-runtime.service.ts');
+  assert.equal((await restarted.nearbyEvents()).map(x=>x.sosId).join(','),'two');
+  release(); await Promise.all([first,second]);
+  // Completion of upload one must not overwrite packet two's newly queued relay.
+  assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2'))[0].sosId,'two');
+  inbox=['one']; await runtime.processMeshWork();
+  assert.deepEqual(notifications,['sos-one','sos-two']);
+  assert.equal((await runtime.nearbyEvents()).length,1);
+});
+
+test('local backend reachability works without public internet', async () => {
+  let requested;
+  const { NetworkService } = loader({ '@react-native-community/netinfo': {fetch:async()=>({isConnected:true,isInternetReachable:false,type:'wifi'})} },
+    {fetch:async url=>{requested=url;return {ok:true};}})('src/services/network.service.ts');
+  assert.equal((await NetworkService.checkConnectivity()).isOnline,true);
+  assert.equal(requested,'https://example.test/health');
+});
+
+test('SOS starts nearby advertising before attempting an online upload', async () => {
+  const calls=[]; const store=new Map();
+  const service=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    './location.service':{LocationService:{getCurrentLocation:async()=>payload().location}},
+    './origin-security':{signOrigin:async()=>({})}, 'expo-crypto':{randomUUID:require('node:crypto').randomUUID},
+    './network.service':{NetworkService:{checkConnectivity:async()=>({isOnline:true})}},
+    './sos-api.service':{ApiError:class extends Error {},SOSApiService:{setAuthToken(){},sendSOS:async()=>{calls.push('upload');}}},
+    './ble-mesh.service':{BLEMeshService:class {async requestPermissions(){} async startAdvertising(){calls.push('advertise');} async stopAdvertising(){} }},
+  })('src/services/sos-trigger.service.ts').SOSTriggerService;
+  const result=await service.triggerSOS(params);
+  assert.deepEqual(calls,['advertise','upload']);
+  assert.equal(result.deliveryMethod,'DIRECT_ONLINE');
+});
+
+test('cancelling a queued SOS does not wait for an in-flight upload', async () => {
+  const h=queueHarness(); const event=await h.service.triggerSOS(params);
+  let release; const blocked=new Promise(resolve=>{release=resolve;});
+  let began; const started=new Promise(resolve=>{began=resolve;});
+  h.setBlockSend(async()=>{began();await blocked;}); h.setOnline(true);
+  const retry=h.service.retryPendingQueue();await started;
+  assert.equal(await h.service.cancelSOS(event.sosId,'owner'),true);
+  assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+  release();await retry;
+  assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
 });

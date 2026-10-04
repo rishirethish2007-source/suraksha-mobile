@@ -28,9 +28,9 @@ export class SOSApiService {
 
   private static async request<T>(path: string, options: RequestInit, token?: string): Promise<T> {
     const url = apiUrl(`/api/v1${path}`);
-    for (let attempt = 0; attempt < 3; attempt++) {
+    { // Durable queues schedule subsequent attempts; a request must not monopolize the relay.
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10000);
+      const timer = setTimeout(() => controller.abort(), 4000);
       try {
         const headers = new Headers(options.headers);
         if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -46,11 +46,10 @@ export class SOSApiService {
         }
         return data as T;
       } catch (error) {
-        if (attempt === 2 || (error instanceof ApiError && error.status < 500)) throw error;
+        if (controller.signal.aborted) throw new Error('Backend connection timed out. SOS remains queued for retry.');
+        throw error;
       } finally { clearTimeout(timer); }
-      await new Promise(resolve => setTimeout(resolve, 500 * 2 ** attempt));
     }
-    throw new Error('Request failed');
   }
 
   private static result(data: WireResponse): SOSResponse {
