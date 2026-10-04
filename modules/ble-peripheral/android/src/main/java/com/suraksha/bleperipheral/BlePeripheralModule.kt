@@ -45,6 +45,7 @@ class BlePeripheralModule : Module() {
         AsyncFunction("startScanning") {
             val context = requireContext()
             MeshRuntime.get(context).checkBluetooth()
+            context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE).edit().putBoolean("relay-enabled", true).commit()
             val intent = Intent(context, MeshForegroundService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
             MeshRuntime.get(context).also { it.setForeground(appContext.currentActivity != null); it.startScanning() }
@@ -52,6 +53,7 @@ class BlePeripheralModule : Module() {
         }
         AsyncFunction("stopScanning") {
             val context = requireContext()
+            context.getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE).edit().putBoolean("relay-enabled", false).commit()
             context.stopService(Intent(context, MeshForegroundService::class.java))
             MeshRuntime.get(context).stopScanning()
             true
@@ -71,11 +73,17 @@ class MeshForegroundService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
+            if (!relayEnabled()) { stopSelf(); return }
+            // Native scanning has no JS timer dependency. Recover radio toggles and
+            // transient scan failures even when no React screen is mounted.
+            try { MeshRuntime.get(this@MeshForegroundService).ensureRadio() }
+            catch (_: Exception) { /* Permission/radio state may recover on the next tick. */ }
             try { startService(Intent(this@MeshForegroundService, MeshRelayTaskService::class.java)) }
             catch (_: Exception) { /* Durable inbox is retried on next tick or app launch. */ }
-            handler.postDelayed(this, 30000)
+            handler.postDelayed(this, 15000)
         }
     }
+    private fun relayEnabled() = getSharedPreferences("suraksha-transport", Context.MODE_PRIVATE).getBoolean("relay-enabled", false)
     override fun onCreate() {
         super.onCreate()
         val notifications = getSystemService(NotificationManager::class.java)
@@ -90,13 +98,18 @@ class MeshForegroundService : Service() {
         handler.post(tick)
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        try { MeshRuntime.get(this).startScanning(); MeshRuntime.get(this).resumeAdvertisements() }
+        if (!relayEnabled()) { stopSelf(); return START_NOT_STICKY }
+        try { MeshRuntime.get(this).ensureRadio() }
         catch (error: Exception) {
             MeshRuntime.listener?.invoke("onError", mapOf("error" to (error.message ?: "Bluetooth unavailable")))
-            stopSelf()
-            return START_NOT_STICKY
+            // Keep the user-enabled service alive while Bluetooth is temporarily off.
         }
         return START_STICKY
+    }
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping the activity away must not stop the opt-in foreground service.
+        MeshRuntime.engine?.setForeground(false)
+        super.onTaskRemoved(rootIntent)
     }
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
@@ -189,6 +202,20 @@ internal class MeshEngine(private val context: Context) {
         }
         MeshRuntime.listener?.invoke("onSOSReceived", mapOf("payloadBase64" to packet, "deviceId" to "native"))
         try { context.startService(Intent(context, MeshRelayTaskService::class.java)) } catch (_: Exception) {}
+    }
+    @Synchronized fun ensureRadio() {
+        if (!adapter.isEnabled) {
+            stopScanning()
+            if (advertising || starting) {
+                val saved = packets.toMap()
+                stopAdvertising()
+                packets.putAll(saved)
+                persistPackets()
+            }
+            return
+        }
+        startScanning()
+        resumeAdvertisements()
     }
     fun setForeground(value: Boolean) {
         if (foreground == value) return

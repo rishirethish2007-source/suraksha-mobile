@@ -1,4 +1,4 @@
-# Local test APK 1.0.3
+# Local test APK 1.0.4
 
 Install the updated APK on both Android phones, keeping the existing app data.
 The test build uses http://172.18.67.184:8000 and local test tokens. If the laptop
@@ -49,3 +49,27 @@ BLE discovery and background execution cannot guarantee a delivery deadline.
 TypeScript/regression tests and Android builds do not replace physical two/three
 phone testing. iOS uses the compatible legacy transfer path; its shorter retry
 cooldown still needs an iOS device/build check.
+
+## Android background scanning (1.0.4)
+
+Enable nearby relay once while the app is open. Scanning is registered natively
+under a connected-device foreground service, with an ongoing notification; it
+is not a repeating JavaScript scan window. The service is explicitly independent
+of the recent-app task and uses Android's sticky restart behavior after a system
+process eviction. A native 15-second maintenance tick recovers Bluetooth toggles
+and failed scans without reopening the UI. The opted-in state is saved natively;
+Stop nearby relay clears it before stopping the service.
+
+Test Home, screen lock for several minutes, and swiping the app from Recents
+separately. Trigger a new SOS from A for each case. Test Bluetooth off/on on B,
+then allow a maintenance cycle before triggering another SOS. Confirm Stop nearby
+relay removes the service notification and prevents further scan connections.
+For OEM battery controls, allow background activity/unrestricted battery for
+Suraksha Test. Android can still throttle scans or terminate processes; this is
+not a guaranteed uninterrupted or instant emergency delivery channel.
+
+Force stop, Android's Active apps Stop control, revoked Bluetooth permissions,
+and a powered-off radio prevent scanning. Reopen the app after force stop or
+reboot to re-enable the service; no boot autostart or force-stop bypass is used.
+iOS background execution is OS-controlled and cannot provide the same Android
+foreground-service behavior.
