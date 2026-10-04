@@ -15,7 +15,13 @@ let memory: string | null = null;
 let authority: string | null = null;
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString('hex');
 const bytes = (value: string) => Uint8Array.from(Buffer.from(value, 'hex'));
-const decode = (value: string) => Uint8Array.from(Buffer.from(value, 'base64url'));
+// React Native bundles buffer@6, whose encodings omit Node's 'base64url'.
+// JWT segments use the URL-safe alphabet without padding; normalize explicitly.
+const decode = (value: string): Uint8Array => {
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) throw new Error('Invalid device certificate encoding');
+  const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(Buffer.from(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='), 'base64'));
+};
 type Identity = { deviceId: string; userId: string; secret: string; certificate: string };
 
 async function stored(): Promise<Identity | null> {

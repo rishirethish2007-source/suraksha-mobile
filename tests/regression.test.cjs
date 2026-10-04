@@ -7,7 +7,8 @@ const ts = require('typescript');
 
 // Run the real TypeScript services with only device/network boundaries mocked.
 function loader(mocks = {}, globals = {}) {
-  mocks = { './session.service': { sessionToken: async () => undefined }, ...mocks };
+  // Resolve the same npm Buffer polyfill Metro uses, not Node's richer builtin.
+  mocks = { buffer: require('buffer/'), './session.service': { sessionToken: async () => undefined }, ...mocks };
   const cache = new Map();
   function load(file) {
     file = path.resolve(__dirname, '..', file);
@@ -153,12 +154,17 @@ test('real P-256 certificates verify; forged payload, signature and authority fa
   const header = b64({alg:'ES256',typ:'JWT'});
   const claims = b64({sub:'owner',device_id:'device',public_key:pub(device),iss:'suraksha-device-ca',aud:'suraksha-ble',exp:Math.floor(Date.now()/1000)+3600});
   const certificate = `${header}.${claims}.${Buffer.from(p256.sign(Buffer.from(`${header}.${claims}`),ca)).toString('base64url')}`;
-  const security = loader({ 'expo-secure-store': {getItemAsync:async()=>pub(ca)},
+  const security = loader({ 'expo-secure-store': {getItemAsync:async key=>key==='suraksha.device.v2' ? JSON.stringify({deviceId:'device',userId:'owner',secret:device.toString('hex'),certificate}) : pub(ca)},
     'expo-crypto': {}, 'react-native': {Platform:{OS:'android'}} })('src/services/origin-security.ts');
   const event = payload();
   const signedPayload = JSON.stringify(security.immutableOrigin(event));
   event.originProof = { certificate, signedPayload, signature:Buffer.from(p256.sign(Buffer.from(signedPayload),device)).toString('hex') };
   await security.verifyOrigin(event);
+  const signed = {...event, userName:'Test नमस्ते', message:'Help — test'};
+  signed.originProof = await security.signOrigin(signed);
+  await security.verifyOrigin(signed);
+  assert.equal(p256.verify(Buffer.from(signed.originProof.signature,'hex'),Buffer.from(signed.originProof.signedPayload),p256.getPublicKey(device)),true);
+  await assert.rejects(security.verifyOrigin({...event,originProof:{...event.originProof,certificate:'!.invalid.invalid'}}), /encoding/);
   await assert.rejects(security.verifyOrigin({...event, location:{...event.location, latitude:13}}), /mismatch/);
   await assert.rejects(security.verifyOrigin({...event, originProof:{...event.originProof, signature:'00'.repeat(64)}}), /mismatch/);
   await assert.rejects(security.verifyOrigin({...event, userId:'attacker'}), /Untrusted/);

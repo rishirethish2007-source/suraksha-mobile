@@ -2,7 +2,7 @@ name: Local test APK
 on:
   push:
     branches: [master]
-    paths: ['.github/workflows/local-test-apk.yml']
+    paths: ['.github/workflows/local-test-apk.yml', 'app.config.js', 'src/services/origin-security.ts', 'tests/regression.test.cjs']
   workflow_dispatch:
     inputs:
       backend_url:
