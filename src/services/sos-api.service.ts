@@ -1,6 +1,6 @@
 import { SOSPayload, SOSCancellation, SOSResponse, ActiveSOSEvent, SOSLocation, RelayNode } from '../interfaces/sos.types';
 import { sessionToken } from './session.service';
-import { apiUrl } from '../constants/api';
+import { apiUrl, loadApiSettings } from '../constants/api';
 
 type WireResponse = { success: boolean; sos_id: string; message: string; is_duplicate: boolean; server_timestamp: string };
 const wireLocation = (location: SOSLocation) => ({ ...location, lat: location.latitude, lng: location.longitude });
@@ -27,6 +27,7 @@ export class SOSApiService {
   public static setAuthToken(token?: string) { this.token = token; }
 
   private static async request<T>(path: string, options: RequestInit, token?: string): Promise<T> {
+    await loadApiSettings();
     const url = apiUrl(`/api/v1${path}`);
     { // Durable queues schedule subsequent attempts; a request must not monopolize the relay.
       const controller = new AbortController();

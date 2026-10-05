@@ -16,6 +16,7 @@ import {
 // ── Config ──────────────────────────────────────────────────────
 import { SOSTriggerService } from '../services/sos-trigger.service';
 import { SOSApiService } from '../services/sos-api.service';
+import { BackendSettings } from '../components/BackendSettings';
 import { AuthPanel } from '../components/AuthPanel';
 import { Session, loadSession, signOut } from '../services/session.service';
 import { setRelayEnabled, isRelayEnabled } from '../services/mesh-runtime.service';
@@ -51,6 +52,7 @@ export default function Index() {
   const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'queued' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
   const [relayDevice, setRelayDevice] = useState<string | null>(null);
+  const [settingsVersion, setSettingsVersion] = useState(0);
   const [session, setSession] = useState<Session | null>(null);
   const userId = session?.user.user_id ?? '';
   const userName = session?.user.name ?? '';
@@ -155,7 +157,8 @@ export default function Index() {
       <ScrollView contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>🛡️ Suraksha</Text>
       <Text style={styles.subtitle}>Emergency Response Network</Text>
-      {!session ? <AuthPanel onSession={setSession} /> : <View style={{ padding: 16 }}>
+      <BackendSettings onSaved={() => setSettingsVersion(value => value + 1)} />
+      {!session ? <AuthPanel key={settingsVersion} onSession={setSession} /> : <View style={{ padding: 16 }}>
         <Text style={styles.statusText}>Signed in as {session.user.name}</Text>
         <TouchableOpacity onPress={async () => { await setRelayEnabled(false); await signOut(); SOSApiService.setAuthToken(undefined); setRelayDevice(null); setSession(null); }}><Text style={styles.statusText}>Sign out</Text></TouchableOpacity>
       </View>}

@@ -8,7 +8,7 @@ on:
       backend_url:
         description: Phone-reachable backend origin
         required: true
-        default: 'http://172.18.67.184:8000'
+        default: 'http://172.18.66.69:8000'
 permissions:
   contents: read
 jobs:
@@ -18,7 +18,7 @@ jobs:
     env:
       EXPO_NO_TELEMETRY: '1'
       SURAKSHA_LOCAL_TEST_BUILD: 'true'
-      EXPO_PUBLIC_API_URL: ${{ inputs.backend_url || 'http://172.18.67.184:8000' }}
+      EXPO_PUBLIC_API_URL: ${{ inputs.backend_url || 'http://172.18.66.69:8000' }}
       EXPO_PUBLIC_ENABLE_TEST_LOGIN: 'true'
       EXPO_PUBLIC_ALLOW_INSECURE_HTTP: 'true'
     steps:

@@ -8,7 +8,7 @@ const ts = require('typescript');
 // Run the real TypeScript services with only device/network boundaries mocked.
 function loader(mocks = {}, globals = {}) {
   // Resolve the same npm Buffer polyfill Metro uses, not Node's richer builtin.
-  mocks = { buffer: require('buffer/'), './session.service': { sessionToken: async () => undefined }, ...mocks };
+  mocks = { '@react-native-async-storage/async-storage': {getItem:async()=>null,setItem:async()=>{}}, buffer: require('buffer/'), './session.service': { sessionToken: async () => undefined }, ...mocks };
   const cache = new Map();
   function load(file) {
     file = path.resolve(__dirname, '..', file);
@@ -23,7 +23,7 @@ function loader(mocks = {}, globals = {}) {
       return require(name);
     };
     vm.runInNewContext(code, { module, exports: module.exports, require: localRequire,
-      console, setTimeout, clearTimeout, Date, Headers, FormData, AbortController, Uint8Array,
+      console, setTimeout, clearTimeout, Date, Headers, FormData, AbortController, Uint8Array, URL,
       process: { env: { EXPO_PUBLIC_API_URL: 'https://example.test' } }, ...globals }, { filename: file });
     return module.exports;
   }
@@ -262,4 +262,43 @@ test('cancelling a queued SOS does not wait for an in-flight upload', async () =
   assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
   release();await retry;
   assert.equal(h.store.get('@suraksha_sos_queue'),'[]');
+});
+
+test('backend setting survives restart and rejects credential/path URLs', async () => {
+  const store=new Map();const storage={getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)};
+  const config=loader({'@react-native-async-storage/async-storage':storage})('src/constants/api.ts');
+  await config.saveApiOrigin('https://new-server.example:8443/');
+  assert.equal(config.apiUrl('/health'),'https://new-server.example:8443/health');
+  const restarted=loader({'@react-native-async-storage/async-storage':storage})('src/constants/api.ts');
+  await restarted.loadApiSettings();assert.equal(restarted.API_ORIGIN,'https://new-server.example:8443');
+  for(const url of ['https://user:secret@example.org','https://example.org/path','https://example.org/?token=x','javascript:alert(1)','http://example.org'])assert.throws(()=>config.normalizeOrigin(url));
+});
+
+test('persistent account refresh coalesces concurrent requests and revokes on sign-out', async () => {
+  const store=new Map([['suraksha.session.v1',JSON.stringify({provider:'local',accessToken:'expired',refreshToken:'persistent-secret',expiresAt:0,user:{user_id:'u'}})]]);
+  let refreshes=0,revocations=0;
+  const mocks={ 'expo-secure-store':{getItemAsync:async k=>store.get(k)??null,setItemAsync:async(k,v)=>store.set(k,v),deleteItemAsync:async k=>store.delete(k)},
+    'expo-auth-session':{},'react-native':{Platform:{OS:'android'}},
+    './timed-fetch':{timedFetch:async url=>{
+      if(url.endsWith('/refresh')){refreshes++;await new Promise(r=>setTimeout(r,5));return {ok:true,json:async()=>({access_token:'renewed',expires_in:900})};}
+      if(url.endsWith('/logout')){revocations++;return {ok:true};}throw Error(url);
+    }} };
+  const service=loader(mocks)('src/services/session.service.ts');
+  assert.deepEqual(await Promise.all([service.sessionToken(),service.sessionToken()]),['renewed','renewed']);
+  assert.equal(refreshes,1);
+  const restarted=loader(mocks)('src/services/session.service.ts');assert.equal(await restarted.sessionToken(),'renewed');
+  await service.signOut();assert.equal(revocations,1);assert.equal(store.has('suraksha.session.v1'),false);
+});
+
+test('IP changes probe without credentials and reject a different backend authority', async () => {
+  const store=new Map();const ca='04'+'aa'.repeat(64);let remote=ca,options;
+  const load=loader({
+    '@react-native-async-storage/async-storage':{getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
+    'expo-secure-store':{getItemAsync:async()=>ca},
+    './timed-fetch':{timedFetch:async(url,opts)=>{options=opts;return {ok:true,json:async()=>({ca_public_key:remote})};}},
+  });
+  const service=load('src/services/backend-settings.service.ts');
+  await service.checkAndSaveBackend('https://moved.example');assert.equal(options,undefined);
+  remote='04'+'bb'.repeat(64);await assert.rejects(service.checkAndSaveBackend('https://unrelated.example'),/different identity/);
+  assert.equal(load('src/constants/api.ts').API_ORIGIN,'https://moved.example');
 });

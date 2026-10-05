@@ -2,7 +2,7 @@
  * @fileoverview Network service to check for active internet connectivity.
  */
 
-import { apiUrl } from '../constants/api';
+import { apiUrl, loadApiSettings } from '../constants/api';
 
 import NetInfo, { NetInfoState, NetInfoSubscription } from '@react-native-community/netinfo';
 
@@ -13,6 +13,7 @@ export class NetworkService {
    * to avoid false positives with captive portals or local-only connections.
    */
   public static async checkConnectivity(): Promise<{ isOnline: boolean; connectionType: string }> {
+    await loadApiSettings();
     const state: NetInfoState = await NetInfo.fetch();
     
     const confirmedOnline = !!state.isConnected && await this.pingServer();

@@ -57,8 +57,13 @@ export function immutableOrigin(payload: SOSPayload) {
     origin_device_id: payload.originDeviceId, ttl_seconds: payload.ttlSeconds, max_hops: payload.maxHops, message: payload.message || '' };
 }
 export async function signOrigin(payload: SOSPayload): Promise<OriginProof> {
-  const identity = await stored();
+  let identity = await stored();
   if (!identity || identity.userId !== payload.userId || identity.deviceId !== payload.originDeviceId) throw new Error('Enroll this device online before sending offline SOS.');
+  const claims = JSON.parse(Buffer.from(decode(identity.certificate.split('.')[1])).toString('utf8'));
+  if (claims.exp * 1000 < Date.now() + 86400000) {
+    try { await enrollDevice(identity.deviceId, identity.userId); identity = (await stored())!; }
+    catch { /* A still-valid certificate can continue working offline. */ }
+  }
   const signedPayload = JSON.stringify(immutableOrigin(payload));
   const proof = { certificate: identity.certificate, signedPayload,
     signature: hex(p256.sign(Buffer.from(signedPayload, 'utf8'), bytes(identity.secret), { prehash: true, lowS: true })) };

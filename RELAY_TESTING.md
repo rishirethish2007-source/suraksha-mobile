@@ -73,3 +73,21 @@ and a powered-off radio prevent scanning. Reopen the app after force stop or
 reboot to re-enable the service; no boot autostart or force-stop bypass is used.
 iOS background execution is OS-controlled and cannot provide the same Android
 foreground-service behavior.
+
+## Accounts and editable backend address (1.1.0)
+
+Update suraksha-backend and run `alembic upgrade head` before using this APK.
+Settings → Backend address → Check connection and save accepts the current laptop
+origin, for example http://172.18.66.69:8000. The address is retained across restarts.
+An IP change for the same backend keeps your sign-in; a different device CA is
+rejected rather than transferring queued SOS data or credentials silently.
+
+Sign out of old phone-a/phone-b test accounts, then create your own account with
+email, password (12+ characters), name and phone. SecureStore retains a revocable
+refresh secret; short-lived access tokens renew automatically. No daily token
+copying is needed for account sign-in. Test closing/reopening the app and sending
+an SOS after 15 minutes. Enable nearby relay again after signing in.
+
+Users register with role user. Dashboard responders are promoted by the backend
+operator using scripts/manage_account.py; the dashboard also accepts their
+email/password. Test tokens remain in Advanced and still have their old expiry.
