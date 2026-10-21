@@ -75,7 +75,7 @@ async function receiveMeshInbox(): Promise<void> {
       }
       const firstReceipt = !events.some(event => event.sosId === payload.sosId);
       if (firstReceipt) {
-        const distanceMeters = selfLocation ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
+        const distanceMeters = selfLocation && payload.location ? bleMeshInstance.calculateDistance(selfLocation.latitude, selfLocation.longitude,
           payload.location.latitude, payload.location.longitude) : undefined;
         const event = { ...payload, distanceMeters };
         events = [...events.slice(-199), event];

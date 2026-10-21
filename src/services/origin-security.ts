@@ -53,14 +53,14 @@ export async function enrollDevice(deviceId: string, userId: string): Promise<vo
 export function immutableOrigin(payload: SOSPayload) {
   return { sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
     user_phone: payload.userPhone || '', sos_type: payload.sosType,
-    lat: payload.location.latitude, lng: payload.location.longitude, timestamp: payload.timestamp,
+    lat: payload.location?.latitude ?? null, lng: payload.location?.longitude ?? null, timestamp: payload.timestamp,
     origin_device_id: payload.originDeviceId, ttl_seconds: payload.ttlSeconds, max_hops: payload.maxHops, message: payload.message || '' };
 }
-export async function signOrigin(payload: SOSPayload): Promise<OriginProof> {
+export async function signOrigin(payload: SOSPayload, allowRenewal = true): Promise<OriginProof> {
   let identity = await stored();
   if (!identity || identity.userId !== payload.userId || identity.deviceId !== payload.originDeviceId) throw new Error('Enroll this device online before sending offline SOS.');
   const claims = JSON.parse(Buffer.from(decode(identity.certificate.split('.')[1])).toString('utf8'));
-  if (claims.exp * 1000 < Date.now() + 86400000) {
+  if (allowRenewal && claims.exp * 1000 < Date.now() + 86400000) {
     try { await enrollDevice(identity.deviceId, identity.userId); identity = (await stored())!; }
     catch { /* A still-valid certificate can continue working offline. */ }
   }

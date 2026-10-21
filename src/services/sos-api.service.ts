@@ -9,7 +9,7 @@ export const toWirePayload = (payload: SOSPayload) => ({
     signed_payload: payload.originProof.signedPayload, signature: payload.originProof.signature } : undefined,
   sos_id: payload.sosId, user_id: payload.userId, user_name: payload.userName,
   user_phone: payload.userPhone, sos_type: payload.sosType, message_type: payload.messageType,
-  location: wireLocation(payload.location), delivery_method: payload.deliveryMethod,
+  location: payload.location ? wireLocation(payload.location) : null, delivery_method: payload.deliveryMethod,
   hop_count: payload.hopCount, max_hops: payload.maxHops,
   relay_chain: payload.relayChain.map(node => ({ device_id: node.deviceId, timestamp: node.timestamp,
     location: node.location ? wireLocation(node.location) : undefined, rssi: node.rssi })),
@@ -80,7 +80,7 @@ export class SOSApiService {
       accuracy: value.accuracy ?? 0, provider: value.provider ?? 'network' });
     return events.map(event => ({
       sosId: event.sos_id, userId: event.user_id, userName: event.user_name, userPhone: event.user_phone ?? '',
-      sosType: event.sos_type, messageType: event.message_type, location: location(event.location),
+      sosType: event.sos_type, messageType: event.message_type, location: event.location ? location(event.location) : null,
       timestamp: event.client_timestamp, createdAt: event.created_at, originDeviceId: event.origin_device_id ?? '',
       hopCount: event.hop_count, maxHops: event.max_hops ?? 15, ttlSeconds: event.ttl_seconds ?? 3600,
       relayChain: (event.relay_chain ?? []).map((node): RelayNode => ({ deviceId: node.device_id, timestamp: node.timestamp,
