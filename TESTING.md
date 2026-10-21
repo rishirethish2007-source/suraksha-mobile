@@ -96,3 +96,16 @@ The **Local test APK** GitHub Actions workflow produces an installable, ARM64 An
 The initial build connects to `http://172.18.67.184:8000`. Keep the updated backend running on that laptop with `uvicorn app.main:app --host 0.0.0.0 --port 8000`. Both devices must be on a network that permits reaching that address. Paste the phone-a token from that backend's generated `dev-tokens.json`, then tap **Connect test account and enroll device**. No tokens or signing secrets are bundled in the APK. If `/api/v1/identity/me` is missing, update the backend; an older `/docs` page alone does not mean the signed-device API is available.
 
 Local HTTP is deliberately allowed only in this explicitly selected native test configuration. Do not use it for real emergencies or real account credentials. The normal app configuration remains unchanged. If the laptop IP changes, run the workflow manually with the new backend URL and install its new artifact. This does not configure or launch the backend on your PC.
+
+## SOS without internet or location
+Deploy the backend first and run `alembic upgrade head` (migration 006 permits null coordinates).
+Install a rebuilt mobile app on two real phones signed in/enrolled while online.
+On phone A, disable Wi-Fi/mobile data and GPS; keep Bluetooth enabled.
+Trigger SOS: it must advertise over Bluetooth without asking for a GPS fix.
+Phone B with relay enabled should show the alert with location unavailable.
+With B offline it should rebroadcast; with B online it should upload the same SOS ID.
+The dashboard must show the alert without map/directions controls or a fabricated (0,0) pin.
+Reconnect A: retry must use the same ID without duplicates. Verify cancellation and TTL expiry.
+Repeat with Bluetooth disabled/permission denied: report queued, never confirmed delivery.
+Already-installed older apps require an update to recognize null-location BLE packets.
+Device enrollment and a still-valid certificate remain required for authenticated offline relay.

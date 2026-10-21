@@ -85,7 +85,7 @@ test('BLE round-trip excludes bearer tokens and rejects expired/oversized packet
 
 function queueHarness() {
   const store = new Map();
-  let blockSend; let online = false; let failSend = false; let failCancel = false; let advertise = false;
+  let locationCalls = 0; let failLocation = false; let blockSend; let online = false; let failSend = false; let failCancel = false; let advertise = false;
   const sent = [];
   const storage = { async getItem(key) { await Promise.resolve(); return store.get(key) ?? null; },
     async setItem(key,value) { await Promise.resolve(); store.set(key,value); } };
@@ -99,7 +99,7 @@ function queueHarness() {
     async cancelSOS() { if (failCancel) throw Error('Offline'); return { success: true }; } };
   const load = loader({
     '@react-native-async-storage/async-storage': storage,
-    './location.service': { LocationService: { async getCurrentLocation() { return payload().location; } } },
+    './location.service': { LocationService: { async getCurrentLocation() { locationCalls++; if (failLocation) throw Error("No GPS"); return payload().location; } } },
     './network.service': { NetworkService: { async checkConnectivity() { return { isOnline: online }; } } },
     './origin-security': { signOrigin: async () => ({ certificate: 'test', signedPayload: '{}', signature: 'test' }) },
     'expo-crypto': { randomUUID: require('node:crypto').randomUUID },
@@ -107,7 +107,7 @@ function queueHarness() {
   });
   return { service: load('src/services/sos-trigger.service.ts').SOSTriggerService, store, sent,
     setBlockSend(value) { blockSend=value; }, setOnline(value) { online=value; }, setFailSend(value) { failSend=value; }, setFailCancel(value) { failCancel=value; },
-    setAdvertise(value) { advertise=value; } };
+    setAdvertise(value) { advertise=value; }, setFailLocation(value) { failLocation=value; }, locationCalls() { return locationCalls; } };
 }
 const params = { userId:'owner', userName:'Name', userPhone:'123', sosType:'MEDICAL', authToken:'secret' };
 
@@ -163,6 +163,11 @@ test('real P-256 certificates verify; forged payload, signature and authority fa
   const signed = {...event, userName:'Test नमस्ते', message:'Help — test'};
   signed.originProof = await security.signOrigin(signed);
   await security.verifyOrigin(signed);
+  const noLocation = {...event, location:null};
+  noLocation.originProof = await security.signOrigin(noLocation, false);
+  await security.verifyOrigin(noLocation);
+  assert.equal(JSON.parse(noLocation.originProof.signedPayload).lat, null);
+  await assert.rejects(security.verifyOrigin({...noLocation, location:event.location}), /mismatch/);
   assert.equal(p256.verify(Buffer.from(signed.originProof.signature,'hex'),Buffer.from(signed.originProof.signedPayload),p256.getPublicKey(device)),true);
   await assert.rejects(security.verifyOrigin({...event,originProof:{...event.originProof,certificate:'!.invalid.invalid'}}), /encoding/);
   await assert.rejects(security.verifyOrigin({...event, location:{...event.location, latitude:13}}), /mismatch/);
@@ -172,11 +177,11 @@ test('real P-256 certificates verify; forged payload, signature and authority fa
 
 test('relay inbox is acknowledged only after persistence and failed uploads remain queued', async () => {
   const store = new Map(); let inbox = ['packet']; let fail = true; let notifications = 0; let advertised = 0;
-  const event = payload('relay-test');
+  const event = {...payload('relay-test'), location:null};
   const load = loader({
     '@react-native-async-storage/async-storage': {getItem:async k=>store.get(k)??null,setItem:async(k,v)=>store.set(k,v)},
     'expo-notifications':{scheduleNotificationAsync:async()=>{notifications++;}},
-    'expo-location':{getLastKnownPositionAsync:async()=>null},'expo-background-task':{},
+    'expo-location':{getLastKnownPositionAsync:async()=>({coords:{latitude:12,longitude:77,accuracy:5}})},'expo-background-task':{},
     'react-native':{Platform:{OS:'android'}},
     '../../modules/ble-peripheral':{getInbox:async()=>inbox,acknowledgeInbox:async()=>{assert.equal(JSON.parse(store.get('@suraksha.relay.pending.v2')).length,1);inbox=[];}},
     './ble-codec':{decodePayload:()=>event,isLivePayload:()=>true},
@@ -301,4 +306,45 @@ test('IP changes probe without credentials and reject a different backend author
   await service.checkAndSaveBackend('https://moved.example');assert.equal(options,undefined);
   remote='04'+'bb'.repeat(64);await assert.rejects(service.checkAndSaveBackend('https://unrelated.example'),/different identity/);
   assert.equal(load('src/constants/api.ts').API_ORIGIN,'https://moved.example');
+});
+
+test('offline SOS bypasses GPS and advertises a durable locationless alert', async () => {
+  const h = queueHarness(); h.setAdvertise(true); h.setFailLocation(true);
+  const event = await h.service.triggerSOS(params);
+  assert.equal(h.locationCalls(), 0);
+  assert.equal(event.location, null);
+  assert.equal(event.deliveryMethod, 'BLE_RELAY');
+  assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue'))[0].location, null);
+  h.setOnline(true); await h.service.retryPendingQueue();
+  assert.equal(h.sent[0].location, null);
+});
+
+test('online GPS failure still sends the emergency without coordinates', async () => {
+  const h = queueHarness(); h.setOnline(true); h.setFailLocation(true);
+  const event = await h.service.triggerSOS(params);
+  assert.equal(event.deliveryMethod, 'DIRECT_ONLINE');
+  assert.equal(h.sent[0].location, null);
+});
+
+test('locationless BLE packets and API submissions preserve null without fake coordinates', () => {
+  const load = loader();
+  const codec = load('src/services/ble-codec.ts');
+  const event = {...payload(), location:null};
+  const decoded = codec.decodePayload(codec.encodePayload(event));
+  assert.equal(decoded.location, null);
+  assert.equal(load('src/services/sos-api.service.ts').toWirePayload(event).location, null);
+  assert.equal(codec.isLivePayload({...event, location:{latitude:NaN,longitude:1}}), false);
+  assert.equal(codec.isLivePayload({...event, location:undefined}), false);
+});
+
+test('Android offline advertising does not require location permission', async () => {
+  let requested;
+  const permissions = {BLUETOOTH_SCAN:'scan',BLUETOOTH_CONNECT:'connect',BLUETOOTH_ADVERTISE:'advertise',ACCESS_FINE_LOCATION:'gps'};
+  const {BLEMeshService} = loader({
+    'react-native':{Platform:{OS:'android',Version:36},PermissionsAndroid:{PERMISSIONS:permissions,RESULTS:{GRANTED:'granted'},
+      requestMultiple:async values=>{requested=values;return Object.fromEntries(values.map(v=>[v,'granted']));}}},
+    '../../modules/ble-peripheral':{},
+  })('src/services/ble-mesh.service.ts');
+  await new BLEMeshService().requestPermissions(true);
+  assert.deepEqual(Array.from(requested), ['connect','advertise']);
 });

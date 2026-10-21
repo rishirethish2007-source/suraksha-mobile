@@ -106,7 +106,7 @@ export interface SOSPayload {
   /** Type of emergency */
   sosType: SOSType;
   /** Location data from device sensors */
-  location: SOSLocation;
+  location: SOSLocation | null;
   /** ISO 8601 UTC timestamp of the SOS trigger */
   timestamp: string;
   /** Immutable unique identifier for the hardware/installation originating the SOS */

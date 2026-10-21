@@ -12,8 +12,8 @@ export function isLivePayload(payload: SOSPayload): boolean {
     Number.isInteger(payload.hopCount) && payload.hopCount >= 0 &&
     Number.isInteger(payload.maxHops) && payload.maxHops >= 0 && payload.maxHops <= 15 && payload.hopCount <= payload.maxHops &&
     Array.isArray(payload.relayChain) && payload.relayChain.length <= 15 && payload.relayChain.every(node => node && typeof node.deviceId === 'string' && Number.isFinite(Date.parse(node.timestamp))) &&
-    !!payload.location && Number.isFinite(payload.location.latitude) && Math.abs(payload.location.latitude) <= 90 &&
-    Number.isFinite(payload.location.longitude) && Math.abs(payload.location.longitude) <= 180;
+    (payload.location === null || (!!payload.location && Number.isFinite(payload.location.latitude) && Math.abs(payload.location.latitude) <= 90 &&
+    Number.isFinite(payload.location.longitude) && Math.abs(payload.location.longitude) <= 180));
 }
 
 export function encodePayload(payload: SOSPayload): string {
