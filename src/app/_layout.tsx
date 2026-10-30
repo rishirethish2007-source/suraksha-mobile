@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { requestInitialPermissions } from '../services/initial-permissions.service';
 import { startMeshRuntime, stopMeshRuntime } from '../services/mesh-runtime.service';
 import * as Notifications from 'expo-notifications';
 import { router, DarkTheme, DefaultTheme, ThemeProvider } from 'expo-router';
@@ -12,7 +13,7 @@ SplashScreen.preventAutoHideAsync();
 
 export default function TabLayout() {
   useEffect(() => {
-    void startMeshRuntime().catch(() => undefined);
+    void requestInitialPermissions().then(() => startMeshRuntime()).catch(() => undefined);
     const notification = Notifications.addNotificationResponseReceivedListener(() => router.push('/'));
     return () => { notification.remove(); stopMeshRuntime(); };
   }, []);

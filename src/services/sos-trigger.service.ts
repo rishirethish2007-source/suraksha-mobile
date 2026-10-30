@@ -45,9 +45,9 @@ export class SOSTriggerService {
     authToken?: string; sosType: SOSType; message?: string }): Promise<SOSPayload> {
     if (!params.userId.trim() || !params.userName.trim()) throw new Error('Enter your user ID and name before sending an SOS.');
     if (params.authToken) SOSApiService.setAuthToken(params.authToken);
-    // Offline SOS must never wait for GPS, its permission prompt, or a network fix.
+    // GPS works offline; a failed fix must never prevent an emergency alert.
     const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
-    const location = isOnline ? await LocationService.getCurrentLocation().catch(() => null) : null;
+    const location = await LocationService.getCurrentLocation().catch(() => null);
     const originDeviceId = await this.getDeviceId();
     const timestamp = new Date().toISOString();
     const payload: SOSPayload = { sosId: uuid(), userId: params.userId.trim(), userName: params.userName.trim(),
