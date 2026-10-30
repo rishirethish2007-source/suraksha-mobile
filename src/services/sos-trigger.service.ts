@@ -45,7 +45,9 @@ export class SOSTriggerService {
     authToken?: string; sosType: SOSType; message?: string }): Promise<SOSPayload> {
     if (!params.userId.trim() || !params.userName.trim()) throw new Error('Enter your user ID and name before sending an SOS.');
     if (params.authToken) SOSApiService.setAuthToken(params.authToken);
-    const location = await LocationService.getCurrentLocation();
+    // Offline SOS must never wait for GPS, its permission prompt, or a network fix.
+    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
+    const location = isOnline ? await LocationService.getCurrentLocation().catch(() => null) : null;
     const originDeviceId = await this.getDeviceId();
     const timestamp = new Date().toISOString();
     const payload: SOSPayload = { sosId: uuid(), userId: params.userId.trim(), userName: params.userName.trim(),
@@ -53,7 +55,7 @@ export class SOSTriggerService {
       location, timestamp, createdAt: timestamp, originDeviceId, hopCount: 0, maxHops: MAX_HOP_COUNT,
       relayChain: [], deliveryMethod: DeliveryMethod.OFFLINE_QUEUED, status: SOSStatus.ACTIVE,
       message: params.message, ttlSeconds: SOS_TTL_SECONDS };
-    payload.originProof = await signOrigin(payload);
+    payload.originProof = await signOrigin(payload, isOnline);
     await this.exclusive(async () => {
       const queue = await this.read<SOSPayload>(QUEUE_KEY);
       queue.push(payload);
@@ -63,12 +65,11 @@ export class SOSTriggerService {
       // Upload success does not retract the nearby alert; cancellation/TTL does.
       let broadcasting = false;
       try {
-        await bleMeshInstance.requestPermissions();
+        await bleMeshInstance.requestPermissions(true);
         await bleMeshInstance.startAdvertising({ ...payload, deliveryMethod: DeliveryMethod.BLE_RELAY });
         broadcasting = true;
       } catch { /* Online delivery still works without Bluetooth. */ }
       try {
-        const { isOnline } = await NetworkService.checkConnectivity();
         if (isOnline) {
           await SOSApiService.sendSOS({ ...payload, deliveryMethod: DeliveryMethod.DIRECT_ONLINE });
           await this.exclusive(() => this.remove(payload.sosId));
@@ -109,7 +110,7 @@ export class SOSTriggerService {
     return this.retrying;
   }
   private static async flushQueue(): Promise<void> {
-    const { isOnline } = await NetworkService.checkConnectivity();
+    const { isOnline } = await NetworkService.checkConnectivity().catch(() => ({ isOnline: false }));
     const cancellations = await this.exclusive(() => this.read<SOSCancellation>(CANCEL_KEY));
     for (const cancellation of cancellations) {
       await this.exclusive(() => this.remove(cancellation.sosId));

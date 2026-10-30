@@ -34,8 +34,8 @@ function RelayPanel({ deviceId, userId }: { deviceId: string; userId: string }) 
     {error && <Text style={{ color: '#ff9b90' }}>{error}</Text>}
     {nearbySOSEvents.map(event => <View key={event.sosId} style={{ padding: 12, borderWidth: 1, borderColor: '#f66' }}>
       <Text style={{ color: '#fff' }}>{event.sosType}: {event.userName} needs help.</Text>
-      <Text style={{ color: '#ddd' }}>{event.distanceMeters == null ? 'Distance unavailable' : `${Math.round(event.distanceMeters)} m away`} · {event.location.latitude.toFixed(5)}, {event.location.longitude.toFixed(5)}</Text>
-      <TouchableOpacity onPress={() => { void Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${event.location.latitude},${event.location.longitude}`).catch(() => Alert.alert('Unable to open maps')); }}><Text style={{ color: '#7af', padding: 8 }}>View location</Text></TouchableOpacity>
+      <Text style={{ color: '#ddd' }}>{event.distanceMeters == null ? 'Distance unavailable' : `${Math.round(event.distanceMeters)} m away`} · {event.location ? `${event.location.latitude.toFixed(5)}, ${event.location.longitude.toFixed(5)}` : 'Location unavailable'}</Text>
+      {event.location && <TouchableOpacity onPress={() => { if (!event.location) return; void Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${event.location.latitude},${event.location.longitude}`).catch(() => Alert.alert('Unable to open maps')); }}><Text style={{ color: '#7af', padding: 8 }}>View location</Text></TouchableOpacity>}
       <TouchableOpacity onPress={async () => {
         try { await SOSApiService.respond(event.sosId, userId); Alert.alert('Response recorded', 'The server has recorded that you are on your way.'); }
         catch (error) { Alert.alert('Response not confirmed', error instanceof Error ? error.message : 'Reconnect and try again.'); }
@@ -109,7 +109,7 @@ export default function Index() {
     sending.current = true;
     setShowPicker(false);
     setStatus('sending');
-    setStatusMsg('Acquiring your location and sending SOS…');
+    setStatusMsg('Preparing emergency SOS…');
     try {
       const payload = await SOSTriggerService.triggerSOS({ userId, userName, userPhone,
         sosType: type });
@@ -120,7 +120,7 @@ export default function Index() {
       } else {
         setStatus('queued');
         setStatusMsg(payload.deliveryMethod === DeliveryMethod.BLE_RELAY
-          ? 'SOS saved locally and advertising over Bluetooth. Server receipt is not confirmed.'
+          ? payload.location ? 'SOS saved locally and advertising over Bluetooth. Server receipt is not confirmed.' : 'SOS advertising over Bluetooth without location. Server receipt is not confirmed.'
           : 'SOS saved on this device. Waiting for connectivity; server receipt is not confirmed.');
       }
     } catch (error) {

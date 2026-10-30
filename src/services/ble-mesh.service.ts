@@ -57,11 +57,14 @@ export class BLEMeshService {
     this.advertisingId = null;
   }
   public reportReceived(payload: SOSPayload) { this.emit('onSOSReceived', payload); }
-  public async requestPermissions(): Promise<void> {
+  public async requestPermissions(advertiseOnly = false): Promise<void> {
     if (Platform.OS === 'android') {
-      const permissions = Number(Platform.Version) >= 31 ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT, PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+      const permissions = Number(Platform.Version) >= 31
+        ? advertiseOnly
+          ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT, PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE]
+          : [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN, PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE, PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION]
+        : advertiseOnly ? [] : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
       const result = await PermissionsAndroid.requestMultiple(permissions);
       if (permissions.some(permission => result[permission] !== PermissionsAndroid.RESULTS.GRANTED)) throw new Error('Nearby relay requires Bluetooth and location permissions.');
     }
