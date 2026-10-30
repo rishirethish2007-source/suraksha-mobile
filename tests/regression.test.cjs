@@ -308,10 +308,10 @@ test('IP changes probe without credentials and reject a different backend author
   assert.equal(load('src/constants/api.ts').API_ORIGIN,'https://moved.example');
 });
 
-test('offline SOS bypasses GPS and advertises a durable locationless alert', async () => {
+test('offline SOS attempts GPS and still advertises when no fix is available', async () => {
   const h = queueHarness(); h.setAdvertise(true); h.setFailLocation(true);
   const event = await h.service.triggerSOS(params);
-  assert.equal(h.locationCalls(), 0);
+  assert.equal(h.locationCalls(), 1);
   assert.equal(event.location, null);
   assert.equal(event.deliveryMethod, 'BLE_RELAY');
   assert.equal(JSON.parse(h.store.get('@suraksha_sos_queue'))[0].location, null);
@@ -347,4 +347,11 @@ test('Android offline advertising does not require location permission', async (
   })('src/services/ble-mesh.service.ts');
   await new BLEMeshService().requestPermissions(true);
   assert.deepEqual(Array.from(requested), ['connect','advertise']);
+});
+
+test('offline SOS includes an available GPS fix', async () => {
+  const h = queueHarness(); h.setAdvertise(true);
+  const event = await h.service.triggerSOS(params);
+  assert.equal(event.location.latitude, 12);
+  assert.equal(event.deliveryMethod, 'BLE_RELAY');
 });
