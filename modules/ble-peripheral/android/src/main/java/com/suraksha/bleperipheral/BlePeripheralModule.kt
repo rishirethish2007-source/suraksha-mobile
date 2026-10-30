@@ -325,17 +325,17 @@ internal class MeshEngine(private val context: Context) {
             // Android reports ALREADY_STARTED when the foreground service and
             // React startup race to start the same scanner. The existing scan
             // remains active, so treat this as active instead of retry-looping.
-            if (code == ScanSettings.SCAN_FAILED_ALREADY_STARTED) {
+            if (code == ScanCallback.SCAN_FAILED_ALREADY_STARTED) {
                 scanning = true
                 return
             }
             scanning = false
             val reason = when (code) {
-                ScanSettings.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "Android could not register the Bluetooth scan"
-                ScanSettings.SCAN_FAILED_INTERNAL_ERROR -> "Android Bluetooth scanner reported an internal error"
-                ScanSettings.SCAN_FAILED_FEATURE_UNSUPPORTED -> "Bluetooth scanning is unsupported on this device"
-                ScanSettings.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> "Bluetooth scan resources are temporarily unavailable"
-                ScanSettings.SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> "Too many Bluetooth scan restarts; retrying shortly"
+                ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "Android could not register the Bluetooth scan"
+                ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "Android Bluetooth scanner reported an internal error"
+                ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "Bluetooth scanning is unsupported on this device"
+                ScanCallback.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> "Bluetooth scan resources are temporarily unavailable"
+                ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> "Too many Bluetooth scan restarts; retrying shortly"
                 else -> "Bluetooth scanning interrupted (code $code); retrying shortly"
             }
             MeshRuntime.listener?.invoke("onError", mapOf("error" to reason))
