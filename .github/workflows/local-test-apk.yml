@@ -1,8 +1,8 @@
 name: Local test APK
 on:
   push:
-    branches: [master]
-    paths: ['.github/workflows/local-test-apk.yml', 'app.config.js', 'modules/ble-peripheral/android/src/main/java/com/suraksha/bleperipheral/BlePeripheralModule.kt', 'src/services/origin-security.ts', 'tests/regression.test.cjs']
+    branches: [master, codex/sos-live-updates-20261101, 'fix/sos-mesh-reliability-*']
+    paths: ['.github/workflows/local-test-apk.yml', 'app.config.js', 'app.json', 'modules/**', 'src/**', 'tests/**', 'package*.json']
   workflow_dispatch:
     inputs:
       backend_url:
@@ -37,15 +37,16 @@ jobs:
       # Expo's generated local release uses its debug signing key. This is a
       # separate, clearly labelled test package, not a store-signed production app.
       # Release embeds JS so offline tests do not depend on a Metro server.
-      - run: ./gradlew :app:assembleRelease --no-daemon --max-workers=2 -PreactNativeArchitectures=arm64-v8a
+      - run: ./gradlew :ble-peripheral:testReleaseUnitTest :app:assembleRelease --no-daemon --max-workers=2 -PreactNativeArchitectures=arm64-v8a
         working-directory: android
       - run: |
           mkdir -p test-apk
           cp android/app/build/outputs/apk/release/app-release.apk test-apk/suraksha-local-test.apk
+          git rev-parse HEAD > test-apk/SOURCE_COMMIT.txt
           sha256sum test-apk/suraksha-local-test.apk > test-apk/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: suraksha-local-test-apk
+          name: suraksha-local-test-apk-${{ github.sha }}
           path: test-apk/
           retention-days: 14
           if-no-files-found: error

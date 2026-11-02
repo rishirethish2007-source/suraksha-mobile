@@ -43,13 +43,16 @@ export enum DeliveryMethod {
 export enum SOSMessageType {
   SOS_ALERT = 'SOS_ALERT',
   SOS_CANCEL = 'SOS_CANCEL',
-  SOS_ACK = 'SOS_ACK'
+  SOS_ACK = 'SOS_ACK',
+  SOS_HELPER = 'SOS_HELPER'
 }
 
 /**
  * Represents the geographic location of an SOS event.
  */
 export interface SOSLocation {
+  /** Sensor capture time, independent of the SOS update time; absent means unknown. */
+  capturedAt?: string;
   /** Latitude in decimal degrees */
   latitude: number;
   /** Longitude in decimal degrees */
@@ -90,6 +93,23 @@ export interface OriginProof {
 }
 
 export interface SOSPayload {
+  /** Version 2 signs control type and revision; absent means legacy alert. */
+  protocolVersion?: 2 | 3;
+  revision?: number;
+  helperRequested?: boolean;
+  helperRequestId?: string;
+  helperRequestExpiresAt?: string;
+  helperState?: 'pending' | 'accepted' | 'declined' | 'withdrawn';
+  receiptKind?: 'peer' | 'server';
+  receiptRevision?: number;
+  receiptMessageType?: SOSMessageType.SOS_ALERT | SOSMessageType.SOS_CANCEL;
+  receiptStatus?: 'received' | 'accepted' | 'cancelled';
+  serverReceipt?: string;
+  receiptUserId?: string;
+  /** Local queue metadata; never transmitted over BLE or HTTP. */
+  uploadOnly?: boolean;
+  targetSosId?: string;
+  targetDeviceId?: string;
   originProof?: OriginProof;
   /** UUIDv4 generated client-side to ensure idempotency and prevent duplicates */
   sosId: string;
@@ -172,6 +192,7 @@ export interface BLEGATTPayload {
  * API Response format for SOS endpoints.
  */
 export interface SOSResponse {
+  receipt?: string;
   /** Whether the operation was successful */
   success: boolean;
   /** Echo of the processed sosId */
